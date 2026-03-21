@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 144 144">
+  <rect width="144" height="144" rx="18" fill="#0c0c0e"/>
+  <rect x="12" y="12" width="120" height="120" rx="12" fill="#a78bfa" opacity="0.15"/>
+  <text x="72" y="68" font-family="monospace" font-size="28" font-weight="bold" fill="#a78bfa" text-anchor="middle">CU</text>
+  <text x="72" y="96" font-family="monospace" font-size="14" fill="#888" text-anchor="middle">WINDOW</text>
+</svg>

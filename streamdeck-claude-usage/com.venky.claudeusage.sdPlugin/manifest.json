@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.venky.claudeusage",
+  "Name": "Claude Usage Monitor",
+  "Version": "1.0.0.0",
+  "Author": "Venky",
+  "Description": "Displays Claude.ai 5-hour and 7-day usage limits on your Stream Deck. Part of the Over Engineered by Venky series.",
+  "Category": "Claude Usage",
+  "CategoryIcon": "imgs/plugin/category-icon",
+  "Icon": "imgs/plugin/marketplace",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 2,
+  "Software": { "MinimumVersion": "6.6" },
+  "OS": [
+    { "Platform": "mac",     "MinimumVersion": "10.15" },
+    { "Platform": "windows", "MinimumVersion": "10" }
+  ],
+  "Nodejs": { "Version": "20", "Debug": "enabled" },
+  "Actions": [
+    {
+      "Name": "5-Hour Window",
+      "UUID": "com.venky.claudeusage.fivehour",
+      "Icon": "imgs/actions/five-hour/icon",
+      "Tooltip": "Shows Claude.ai 5-hour rolling usage window utilization and reset countdown.",
+      "Controllers": ["Keypad"],
+      "States": [
+        { "Image": "imgs/actions/five-hour/key", "TitleAlignment": "middle" }
+      ]
+    },
+    {
+      "Name": "7-Day Window",
+      "UUID": "com.venky.claudeusage.sevenday",
+      "Icon": "imgs/actions/seven-day/icon",
+      "Tooltip": "Shows Claude.ai 7-day rolling usage window utilization and reset countdown.",
+      "Controllers": ["Keypad"],
+      "States": [
+        { "Image": "imgs/actions/seven-day/key", "TitleAlignment": "middle" }
+      ]
+    }
+  ]
+}

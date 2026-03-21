@@ -63,7 +63,18 @@ async function handleUsageData(raw, timestamp) {
   const settings = stored.settings || {};
   updateBadge(snapshot, settings);
 
-  // --- IoT auto-repush cookie ---
+  // --- Stream Deck push (localhost:57891/usage) ---
+  fetch('http://127.0.0.1:57891/usage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fiveHour:         snapshot.five_hour,
+      sevenDay:         snapshot.seven_day,
+      fiveHourResetsAt: snapshot.five_hour_resets_at,
+      sevenDayResetsAt: snapshot.seven_day_resets_at,
+      timestamp:        snapshot.timestamp,
+    }),
+  }).catch(() => {}); // silent — plugin may not be running
   if (settings.iotEnabled && settings.iotEndpoint && stored.orgId) {
     chrome.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' }, (cookie) => {
       if (!cookie) return;
