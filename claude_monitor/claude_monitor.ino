@@ -41,6 +41,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #define POLL_INTERVAL_MS (5UL * 60 * 1000)
 #define NTP_SERVER       "pool.ntp.org"
 #define HTTP_PORT        80
+#define TZ_OFFSET_SEC    (5 * 3600 + 30 * 60)  // IST (UTC+5:30)
 
 // ── State ─────────────────────────────────────────────────────────────────
 struct UsageData {
@@ -267,20 +268,16 @@ void drawScreen() {
   u8g2.sendBuffer();
 }
 
-// ── Parse ISO8601 → seconds from now ─────────────────────────────────────
+// ── Parse ISO8601 to seconds from now ─────────────────────────────────────
+// Assumes timestamps from the API are UTC. mktime() interprets as local
+// (IST per configTime), so we add TZ_OFFSET_SEC to compensate.
 long parseResetsAt(const char* iso) {
   struct tm t = {};
-  int tz_h = 0, tz_m = 0, tz_sign = 1;
   sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d",
     &t.tm_year, &t.tm_mon, &t.tm_mday,
     &t.tm_hour, &t.tm_min, &t.tm_sec);
   t.tm_year -= 1900; t.tm_mon -= 1;
-  const char* tz = strchr(iso, '+');
-  if (!tz) { tz = strrchr(iso, '-'); if (tz && tz > iso + 10) tz_sign = -1; }
-  if (tz) sscanf(tz + 1, "%2d:%2d", &tz_h, &tz_m);
-  // mktime() treats input as local time (IST = UTC+5:30)
-  // but the timestamp values are UTC — add IST offset back to compensate
-  time_t resetUtc = mktime(&t) + (5 * 3600 + 30 * 60);
+  time_t resetUtc = mktime(&t) + TZ_OFFSET_SEC;
   return (long)(resetUtc - time(nullptr));
 }
 
@@ -369,8 +366,7 @@ void setup() {
 
   gWifiOk = true;
 
-  // NTP sync — IST is UTC+5:30 = 19800 seconds offset
-  configTime(5 * 3600 + 30 * 60, 0, NTP_SERVER);
+  configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
 
   // Wait up to 10s for time sync
   u8g2.clearBuffer();
@@ -432,14 +428,14 @@ void loop() {
   }
   gWifiOk = true;
 
+  static unsigned long lastDraw = 0;
+
   if (millis() - gLastPoll >= POLL_INTERVAL_MS || gLastPoll == 0) {
     gLastPoll = millis();
     pollUsage();
     drawScreen();
-  }
-
-  static unsigned long lastDraw = 0;
-  if (millis() - lastDraw >= 30000) {
+    lastDraw = millis();
+  } else if (millis() - lastDraw >= 30000) {
     lastDraw = millis();
     drawScreen();
   }

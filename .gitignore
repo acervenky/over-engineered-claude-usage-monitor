@@ -1,0 +1,7 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# macOS
+.DS_Store

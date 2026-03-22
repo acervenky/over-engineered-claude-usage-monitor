@@ -4,7 +4,7 @@
 
 ### *The Unnecessarily Intrusive API Interceptor & Desk Widget*
 
-A Chrome extension and ESP8266 IoT hardware widget that relentlessly tracks your Claude.ai message limits in real time. Because checking a settings page like a normal person wasn't an option.
+A Chrome extension and IoT hardware widget that relentlessly tracks your Claude.ai message limits in real time. Now available in two hardware variants: the original ESP8266 breadboard build and the self-contained M5Stack ATOMS3R. Because checking a settings page like a normal person wasn't an option.
 
 <br>
 
@@ -20,7 +20,7 @@ A Chrome extension and ESP8266 IoT hardware widget that relentlessly tracks your
 
 **Part of the *Over Engineered by Venky* Series**
 
-> *Welcome to "Over Engineered by Venky", a growing collection of projects where the solution is gloriously, unapologetically disproportionate to the problem. Need to know how many Claude messages you have left? Sure, you could just wait for the "x messages remaining until y time" banner to appear, or try to guess your rolling 5-hour window. But why guess? Instead, you can write a Manifest V3 Chrome Extension that injects scripts into the main world to intercept undocumented API traffic. Have it parse your organization UUID, silently poll Claude's backend every 5 minutes, and auto-rotate session cookies. Then, push that telemetry over your local network to an ESP-12E NodeMCU driving a 0.96" OLED display sitting on your desk. Every project in this series exists because "but I could over-engineer that with data" is a lifestyle, not a suggestion. Efficiency? Optional. Style points? Mandatory.*
+> *Welcome to "Over Engineered by Venky", a growing collection of projects where the solution is gloriously, unapologetically disproportionate to the problem. Need to know how many Claude messages you have left? Sure, you could just wait for the "x messages remaining until y time" banner to appear, or try to guess your rolling 5-hour window. But why guess? Instead, you can write a Manifest V3 Chrome Extension that injects scripts into the main world to intercept undocumented API traffic. Have it parse your organization UUID, silently poll Claude's backend every 5 minutes, and auto-rotate session cookies. Then, push that telemetry over your local network to an ESP-12E NodeMCU driving a 0.96" OLED display sitting on your desk, or to a self-contained M5Stack ATOMS3R with a color round LCD that looks like an actual gauge. Every project in this series exists because "but I could over-engineer that with data" is a lifestyle, not a suggestion. Efficiency? Optional. Style points? Mandatory.*
 
 ---
 
@@ -28,8 +28,9 @@ A Chrome extension and ESP8266 IoT hardware widget that relentlessly tracks your
 [![Data](https://img.shields.io/badge/Data-Undocumented_API-yellow?style=for-the-badge)](#)
 [![Extension](https://img.shields.io/badge/Frontend-MV3_Vanilla_JS-blue?style=for-the-badge)](#)
 [![Edge](https://img.shields.io/badge/Edge-ESP8266_+_OLED-orange?style=for-the-badge)](#)
+[![Edge V2](https://img.shields.io/badge/Edge_V2-ATOMS3R_Color_LCD-purple?style=for-the-badge)](#)
 [![Firmware](https://img.shields.io/badge/Firmware-Arduino_C++-red?style=for-the-badge)](#)
-[![Cost](https://img.shields.io/badge/BOM-~₹550-green?style=for-the-badge)](#)
+[![Cost](https://img.shields.io/badge/BOM-~₹550_/_~$8-green?style=for-the-badge)](#)
 
 </div>
 
@@ -73,9 +74,11 @@ Because why trust your gut when you can maintain a real-time, hardware-accelerat
 
 ## 🔧 The Hardware: Edge Display on a Budget
 
-The hardware edge ensures your AI burnout is always visible. The Chrome extension is merely the brains; the NodeMCU is the dedicated broadcast tower.
+The hardware edge ensures your AI burnout is always visible. The Chrome extension is merely the brains; the hardware widget is the dedicated broadcast tower. Pick your variant:
 
-### 🛒 Bill of Materials
+### 🛒 Variant A: ESP8266 + OLED (Original)
+
+The breadboard build. Four wires, two components, zero elegance.
 
 | # | Component | Role | Cost (₹) |
 |---|-----------|------|-----------|
@@ -85,14 +88,29 @@ The hardware edge ensures your AI burnout is always visible. The Chrome extensio
 
 > **~₹550**: roughly the cost of a large cold brew. A small price to pay to guarantee you never blindly hit a rate limit again.
 
+### 🛒 Variant B: M5Stack ATOMS3R (New)
+
+The self-contained build. No wiring, no breadboard, no excuses. Plug in USB-C and go.
+
+| # | Component | Role | Cost |
+|---|-----------|------|------|
+| 1 | **M5Stack ATOMS3R (C126)** | ESP32-S3 with built-in 0.85" round color IPS LCD (128x128), 8MB flash, 8MB PSRAM, button, WiFi. Everything in a 24x24x13mm package. | ~$8 |
+
+**What you get over the ESP8266 build:**
+- Color-coded progress bars (green/yellow/red by utilization)
+- No soldering or wiring, the display is built in
+- 30x more RAM, dual-core processor
+- Round display that looks like a purpose-built gauge
+- USB-C (no more micro-USB fumbling)
+
 ### 🧠 The Hack
 
 The system relies on a two-part symbiotic relationship between the browser and the microcontroller:
 
 1. **The Interception**: The MV3 extension injects `injected.js` into the Main World of the page, bypassing Chrome's isolated-world limitations, to silently sniff the undocumented `/organizations/{uuid}/` endpoint and extract your UUID.
-2. **The Relay**: The Chrome extension handles the auth by automatically beaming rotating `sessionKey` cookies directly to the NodeMCU every 5 minutes on your Local Area Network.
-3. **The Display**: The NodeMCU takes the raw JSON payload and reconstructs the data into ASCII progress bars (`[████░░░░░░░]`) running at 128x64 resolution.
-4. **The Timekeeper**: The NodeMCU utilizes NTP to keep exact IST time, autonomously ticking the cooldown timers between the extension's explicit 5-minute polling intervals. 
+2. **The Relay**: The Chrome extension handles the auth by automatically beaming rotating `sessionKey` cookies directly to the hardware widget every 5 minutes on your Local Area Network.
+3. **The Display**: The widget takes the raw JSON payload and reconstructs the data into progress bars, monochrome on the ESP8266, color-coded on the ATOMS3R.
+4. **The Timekeeper**: The widget utilizes NTP to keep exact time, autonomously ticking the cooldown timers between the extension's explicit 5-minute polling intervals.
 
 If the browser crashes, the desk widget keeps counting down.
 
@@ -118,16 +136,20 @@ graph TD
         API["Undocumented API<br/>/api/organizations/UUID/usage"]
     end
 
-    subgraph DeskWidget ["📡 ESP8266 Edge Device"]
+    subgraph DeskWidget ["📡 Edge Device (pick one)"]
         direction TB
         Node["NodeMCU ESP-12E<br/>C++ Firmware"]
-        OLED["SSD1306 0.96 OLED<br/>Live Rendering"]
-        
+        OLED["SSD1306 0.96 OLED<br/>Monochrome"]
+        Atom["M5Stack ATOMS3R<br/>ESP32-S3 Firmware"]
+        RoundLCD["GC9A01 0.85 IPS<br/>Color, Round"]
+
         Node -->|I2C| OLED
+        Atom -->|Built-in| RoundLCD
     end
 
     SW -->|HTTPS GET| API
     SW -->|"Network Push<br/>(Cookie + JSON Pacing)"| Node
+    SW -->|"Network Push<br/>(Same API)"| Atom
 ```
 
 ---
@@ -178,15 +200,22 @@ graph TD
 
 Optional. Skip this entirely if you just want the browser extension.
 
-### 2. The IoT Widget (Optional Hardware Addon)
+### 2a. IoT Widget — ESP8266 (Original, requires wiring)
 
 1. Wire your OLED to the NodeMCU (`VCC`→`3V3`, `GND`→`GND`, `SDA`→`D2`, `SCL`→`D1`).
 2. Install the `U8g2`, `WiFiManager`, and `ArduinoJson` libraries in your Arduino IDE.
 3. Flash `claude_monitor/claude_monitor.ino` at 115200 baud.
 4. The device spins up a **ClaudeMonitor** access point. Connect to it, go to `192.168.4.1`, and enter your WiFi details.
-5. Open the Chrome Extension Settings, enter the NodeMCU's local LAN IP address, and click **↑ Push to device**.
+5. Open the Chrome Extension Settings, enter the device's local LAN IP address, and click **Push to device**.
 
-Cookie rotation and status updates are entirely automated from then on. 
+### 2b. IoT Widget — M5Stack ATOMS3R (New, no wiring)
+
+1. Install [PlatformIO](https://platformio.org/install).
+2. `cd claude_monitor_atoms3r && pio run -e atoms3r -t upload`
+3. The device spins up a **ClaudeMonitor** access point. Connect to it, go to `192.168.4.1`, and enter your WiFi details.
+4. Open the Chrome Extension Settings, enter the device's local LAN IP address, and click **Push to device**.
+
+Both variants use the same Chrome extension and the same HTTP API. Cookie rotation and status updates are entirely automated from then on.
 
 ---
 
@@ -200,8 +229,12 @@ claude-usage-ext/
 ├── manifest.json              # Extension MV3 configuration & permissions
 ├── popup.html / .css / .js    # The Heatmap Dashboard UI layer
 ├── options.html / .css / .js  # Settings & Edge Device Portal
-├── claude_monitor/            # Hardware Logic
+├── claude_monitor/            # Hardware Logic (ESP8266 variant)
 │   └── claude_monitor.ino     # C++ Firmware for the ESP8266 + SSD1306
+├── claude_monitor_atoms3r/    # Hardware Logic (ATOMS3R variant)
+│   ├── platformio.ini         # PlatformIO build config
+│   ├── src/main.cpp           # C++ Firmware for the M5Stack ATOMS3R
+│   └── README.md              # ATOMS3R-specific hardware docs
 ├── docs/images/               # UI and hardware photography
 ├── icons/                     # Extension branding assets
 ├── README_firmware.md         # Boring technical pins and library instructions
