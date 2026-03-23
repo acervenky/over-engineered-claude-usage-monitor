@@ -1,37 +1,93 @@
 // Claude Usage Monitor - Background Service Worker
 
-// --- Restore badge on service worker startup (after idle unload) ---
-chrome.storage.local.get(['currentUsage', 'settings'], (data) => {
-  if (data.currentUsage) updateBadge(data.currentUsage, data.settings || {});
-});
+importScripts('iot-push.js');
 
-// --- Keep service worker alive with a periodic alarm ---
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('keepalive', { periodInMinutes: 0.4 });
-});
+const KEEPALIVE_ALARM = 'keepalive';
+const USAGE_POLL_ALARM = 'usage-poll';
+const NOTIFIED_WINDOWS_KEY = 'notifiedWindows';
+
+let usagePollInFlight = null;
+
+setupAlarms();
+restoreBadge();
+
+// --- Keep service worker alive and own usage polling from the background ---
+// setupAlarms() is called at script load (covers SW restart).
+// onInstalled is only needed if install-specific behavior is added later.
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepalive') {
-    // Re-restore badge each time in case it was cleared
-    chrome.storage.local.get(['currentUsage', 'settings'], (data) => {
-      if (data.currentUsage) updateBadge(data.currentUsage, data.settings || {});
-    });
+  if (alarm.name === KEEPALIVE_ALARM) {
+    // Keepalive only prevents the service worker from sleeping.
+    // Badge is restored on startup (line 12) and after each poll.
+    return;
+  }
+  if (alarm.name === USAGE_POLL_ALARM) {
+    pollUsage().catch(() => {});
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'SET_ORG_ID') {
     chrome.storage.local.get('settings', (data) => {
       const settings = { ...(data.settings || {}), autoDetect: false };
-      chrome.storage.local.set({ orgId: msg.orgId, settings });
+      chrome.storage.local.set({ orgId: msg.orgId, settings }, () => {
+        pollUsage().catch(() => {});
+      });
     });
+    return;
   }
-  if (msg.type === 'USAGE_DATA') {
-    handleUsageData(msg.data, msg.timestamp);
+
+  if (msg.type === 'CLEAR_ORG_ID') {
+    chrome.storage.local.remove('orgId');
+    return;
+  }
+
+  if (msg.type === 'POLL_NOW') {
+    pollUsage().catch(() => {});
   }
 });
 
+function setupAlarms() {
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  chrome.alarms.create(USAGE_POLL_ALARM, { periodInMinutes: 5 });
+}
+
+function restoreBadge() {
+  chrome.storage.local.get(['currentUsage', 'settings'], (data) => {
+    if (data.currentUsage) updateBadge(data.currentUsage, data.settings || {});
+  });
+}
+
+async function pollUsage() {
+  if (usagePollInFlight) return usagePollInFlight;
+
+  usagePollInFlight = (async () => {
+    const { orgId } = await chrome.storage.local.get('orgId');
+    if (!orgId) return;
+
+    const res = await fetch(`https://claude.ai/api/organizations/${orgId}/usage`, {
+      credentials: 'include',
+    });
+    if (!res.ok) return;
+
+    const data = await res.json();
+    await handleUsageData(data, Date.now());
+  })();
+
+  try {
+    await usagePollInFlight;
+  } finally {
+    usagePollInFlight = null;
+  }
+}
+
 async function handleUsageData(raw, timestamp) {
-  const stored = await chrome.storage.local.get(['history', 'sessionStart', 'settings', 'lastTimestamp', 'orgId']);
+  const stored = await chrome.storage.local.get([
+    'history',
+    'sessionStart',
+    'settings',
+    'lastTimestamp',
+  ]);
 
   const snapshot = {
     timestamp,
@@ -41,12 +97,10 @@ async function handleUsageData(raw, timestamp) {
     seven_day_resets_at: raw.seven_day?.resets_at ?? null,
   };
 
-  // --- History: keep 30 days ---
   const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   const history = (stored.history || []).filter(h => h.timestamp > cutoff);
   history.push(snapshot);
 
-  // --- Session start snapshot ---
   let sessionStart = stored.sessionStart;
   const lastTs = stored.lastTimestamp || 0;
   const isNewSession = (timestamp - lastTs) > 20 * 60 * 1000;
@@ -59,27 +113,17 @@ async function handleUsageData(raw, timestamp) {
     lastTimestamp: timestamp,
   });
 
-  // --- Badge ---
   const settings = stored.settings || {};
   updateBadge(snapshot, settings);
 
-  // --- IoT auto-repush cookie ---
-  if (settings.iotEnabled && settings.iotEndpoint && stored.orgId) {
-    chrome.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' }, (cookie) => {
-      if (!cookie) return;
-      const sessionKey = `sessionKey=${cookie.value}`;
-      const base = settings.iotEndpoint.startsWith('http')
-        ? settings.iotEndpoint : `http://${settings.iotEndpoint}`;
-      fetch(`${base}/configure`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orgId: stored.orgId, sessionKey }),
-      }).catch(() => {});
-    });
+  // Fire-and-forget: don't block notifications on LAN device response.
+  if (settings.iotEnabled && settings.iotEndpoint) {
+    const base = normalizeEndpoint(settings.iotEndpoint);
+    pushToDevice(base, settings.iotApiKey || DEFAULT_DEVICE_API_KEY, buildDevicePayload(snapshot))
+      .catch(() => {});
   }
 
-  // --- Pace notifications ---
-  checkPaceNotification(snapshot, settings, stored.history || []);
+  await checkPaceNotification(snapshot, settings);
 }
 
 function updateBadge(snapshot, settings) {
@@ -90,26 +134,34 @@ function updateBadge(snapshot, settings) {
   if (util >= 90) color = '#ef4444';
   else if (util >= goal) color = '#f59e0b';
 
-  // Show badge even at 0% so it's always visible once data exists
   const text = snapshot.five_hour !== null ? `${Math.round(util)}%` : '';
   chrome.action.setBadgeText({ text });
   chrome.action.setBadgeBackgroundColor({ color });
 }
 
-// Notify once per window if pace is critical (90%+ with >1hr remaining)
-const notifiedWindows = new Set();
-
-async function checkPaceNotification(snapshot, settings, history) {
+// Notify once per rate window, even across MV3 service worker restarts.
+async function checkPaceNotification(snapshot, settings) {
   if (!settings.paceNotifications) return;
+
   const util = snapshot.five_hour ?? 0;
   const resetsAt = snapshot.five_hour_resets_at;
   if (!resetsAt) return;
 
-  const remaining = new Date(resetsAt) - Date.now();
-  const windowKey = resetsAt;
+  const now = Date.now();
+  const remaining = new Date(resetsAt) - now;
 
-  if (util >= 90 && remaining > 60 * 60 * 1000 && !notifiedWindows.has(windowKey)) {
-    notifiedWindows.add(windowKey);
+  // Only touch storage when the notification condition could fire.
+  if (util < 90 || remaining <= 60 * 60 * 1000) return;
+
+  const stored = await chrome.storage.local.get(NOTIFIED_WINDOWS_KEY);
+  const notifiedWindows = Object.fromEntries(
+    Object.entries(stored[NOTIFIED_WINDOWS_KEY] || {})
+      .filter(([resetTime]) => new Date(resetTime).getTime() > now)
+  );
+
+  if (!notifiedWindows[resetsAt]) {
+    notifiedWindows[resetsAt] = now;
+    await chrome.storage.local.set({ [NOTIFIED_WINDOWS_KEY]: notifiedWindows });
     chrome.notifications.create({
       type: 'basic',
       iconUrl: 'icons/icon48.png',
@@ -118,4 +170,3 @@ async function checkPaceNotification(snapshot, settings, history) {
     });
   }
 }
-

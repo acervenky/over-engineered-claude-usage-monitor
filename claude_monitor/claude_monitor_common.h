@@ -1,0 +1,1 @@
+../shared/claude_monitor_common.h

@@ -1,11 +1,14 @@
 // Claude Usage Monitor - Options Script
+// iot-push.js is loaded via <script> tag before this file
 
-async function getSessionCookie() {
-  return new Promise((resolve) => {
-    chrome.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' }, (cookie) => {
-      resolve(cookie ? `sessionKey=${cookie.value}` : null);
-    });
-  });
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const _flashTimers = new WeakMap();
+function flashStatus(el, color, message, ms = 3000) {
+  clearTimeout(_flashTimers.get(el));
+  el.style.color = color;
+  el.textContent = message;
+  _flashTimers.set(el, setTimeout(() => el.textContent = '', ms));
 }
 
 async function load() {
@@ -19,6 +22,7 @@ async function load() {
   document.getElementById('goal-7d').value       = goals.seven_day ?? 70;
   document.getElementById('pace-notifs').checked = !!s.paceNotifications;
   document.getElementById('iot-endpoint').value  = s.iotEndpoint || '';
+  document.getElementById('iot-api-key').value   = s.iotApiKey || DEFAULT_DEVICE_API_KEY;
   document.getElementById('iot-enabled').checked = !!s.iotEnabled;
 
   syncAutoDetect();
@@ -33,77 +37,54 @@ function syncAutoDetect() {
 
 document.getElementById('auto-detect').addEventListener('change', syncAutoDetect);
 
-// Push to device — reads session cookie automatically
 document.getElementById('push-btn').addEventListener('click', async () => {
   const endpoint = document.getElementById('iot-endpoint').value.trim();
+  const apiKey   = document.getElementById('iot-api-key').value.trim();
   const status   = document.getElementById('push-status');
 
-  const stored = await chrome.storage.local.get('orgId');
-  const orgId  = stored.orgId || document.getElementById('org-id').value.trim();
-
   if (!endpoint) {
-    status.style.color = 'var(--red)';
-    status.textContent = '✗ enter device IP first';
-    setTimeout(() => status.textContent = '', 3000);
+    flashStatus(status, 'var(--red)', '\u2717 enter device IP first');
     return;
   }
-  if (!orgId || orgId.length !== 36) {
-    status.style.color = 'var(--red)';
-    status.textContent = '✗ org ID not detected yet — open claude.ai first';
-    setTimeout(() => status.textContent = '', 3000);
+  if (!apiKey) {
+    flashStatus(status, 'var(--red)', '\u2717 enter device API key');
+    return;
+  }
+
+  const stored = await chrome.storage.local.get('currentUsage');
+  if (!stored.currentUsage) {
+    flashStatus(status, 'var(--red)', '\u2717 no usage data yet \u2014 open claude.ai first');
     return;
   }
 
   const btn = document.getElementById('push-btn');
   btn.disabled = true;
   status.style.color = 'var(--dim)';
-  status.textContent = 'reading cookie...';
-
-  const sessionKey = await getSessionCookie();
-  if (!sessionKey) {
-    status.style.color = 'var(--red)';
-    status.textContent = '✗ not logged in to claude.ai';
-    btn.disabled = false;
-    setTimeout(() => status.textContent = '', 3000);
-    return;
-  }
-
   status.textContent = 'pushing...';
 
   try {
-    const base = endpoint.startsWith('http') ? endpoint : `http://${endpoint}`;
-    const res  = await fetch(`${base}/configure`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orgId, sessionKey }),
-    });
-    const json = await res.json();
-    if (json.ok) {
-      status.style.color = 'var(--green)';
-      status.textContent = '✓ device configured!';
+    const base = normalizeEndpoint(endpoint);
+    const res = await pushToDevice(base, apiKey, buildDevicePayload(stored.currentUsage));
+    if (res.ok) {
+      flashStatus(status, 'var(--green)', '\u2713 pushed to device', 4000);
+    } else if (res.status === 401) {
+      flashStatus(status, 'var(--red)', '\u2717 API key rejected by device', 4000);
     } else {
-      status.style.color = 'var(--red)';
-      status.textContent = `✗ ${json.error || 'failed'}`;
+      flashStatus(status, 'var(--red)', `\u2717 device returned ${res.status}`, 4000);
     }
   } catch (e) {
-    status.style.color = 'var(--red)';
-    status.textContent = '✗ could not reach device';
+    flashStatus(status, 'var(--red)', '\u2717 could not reach device', 4000);
   }
 
   btn.disabled = false;
-  setTimeout(() => status.textContent = '', 4000);
 });
 
-// Save settings
 document.getElementById('save-btn').addEventListener('click', async () => {
   const orgId      = document.getElementById('org-id').value.trim();
   const autoDetect = document.getElementById('auto-detect').checked;
 
-  if (!autoDetect && orgId && !/^[0-9a-f-]{36}$/.test(orgId)) {
-    const st = document.getElementById('save-status');
-    st.style.color = 'var(--red)';
-    st.textContent = '✗ invalid UUID format';
-    setTimeout(() => st.textContent = '', 3000);
+  if (!autoDetect && orgId && !UUID_RE.test(orgId)) {
+    flashStatus(document.getElementById('save-status'), 'var(--red)', '\u2717 invalid UUID format');
     return;
   }
 
@@ -115,26 +96,27 @@ document.getElementById('save-btn').addEventListener('click', async () => {
     },
     paceNotifications: document.getElementById('pace-notifs').checked,
     iotEndpoint:       document.getElementById('iot-endpoint').value.trim(),
+    iotApiKey:         document.getElementById('iot-api-key').value.trim(),
     iotEnabled:        document.getElementById('iot-enabled').checked,
   };
 
   const toSave = { settings };
   if (!autoDetect && orgId) toSave.orgId = orgId;
   await chrome.storage.local.set(toSave);
+  if (autoDetect) await chrome.storage.local.remove('orgId');
+  if (!autoDetect && orgId) chrome.runtime.sendMessage({ type: 'SET_ORG_ID', orgId }).catch(() => {});
+  if (autoDetect) chrome.runtime.sendMessage({ type: 'CLEAR_ORG_ID' }).catch(() => {});
 
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
-  let needsReload = false;
-  for (const tab of tabs) {
-    if (!autoDetect && orgId)
+  if (autoDetect) {
+    for (const tab of tabs) chrome.tabs.reload(tab.id);
+  } else if (orgId) {
+    for (const tab of tabs)
       chrome.tabs.sendMessage(tab.id, { type: 'ORG_ID_UPDATED', orgId }).catch(() => {});
-    if (autoDetect) needsReload = true;
   }
-  if (needsReload) for (const tab of tabs) chrome.tabs.reload(tab.id);
 
   const st = document.getElementById('save-status');
-  st.style.color = 'var(--green)';
-  st.textContent = autoDetect ? '✓ saved — reloading claude.ai…' : '✓ saved';
-  setTimeout(() => st.textContent = '', 3000);
+  flashStatus(st, 'var(--green)', autoDetect ? '\u2713 saved \u2014 reloading claude.ai\u2026' : '\u2713 saved');
 });
 
 document.getElementById('clear-history').addEventListener('click', async () => {

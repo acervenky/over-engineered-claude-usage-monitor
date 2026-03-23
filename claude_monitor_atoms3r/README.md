@@ -1,4 +1,4 @@
-# Claude Usage Monitor — M5Stack ATOMS3R Firmware
+# Claude Usage Monitor -- M5Stack ATOMS3R Firmware
 
 ## Hardware
 
@@ -11,14 +11,26 @@ M5Stack ATOMS3R (C126): self-contained, no external wiring.
 - USB-C
 - WiFi + Bluetooth 5.0
 
+## Firmware Configuration
+
+Edit `src/main.cpp` before flashing:
+
+```c
+#define HTTP_PORT  8080                          // port the device listens on
+#define API_KEY    "change-me-to-something-secret"  // must match daemon --api-key
+#define TZ_OFFSET_SEC  (5 * 3600 + 30 * 60)     // your timezone offset from UTC
+```
+
 ## PlatformIO Setup
 
 ```bash
 cd claude_monitor_atoms3r
-pio run -e atoms3r        # compile
+pio run -e atoms3r             # compile
 pio run -e atoms3r -t upload   # flash
-pio device monitor        # serial monitor
+pio device monitor             # serial monitor
 ```
+
+Or from the project root: `make flash-atoms3r`
 
 ### Dependencies (managed by PlatformIO)
 
@@ -30,47 +42,43 @@ pio device monitor        # serial monitor
 
 1. Flash the firmware via USB-C.
 2. On first boot, it creates a WiFi AP: **ClaudeMonitor**.
-3. Connect to that AP on your phone/laptop, browser opens captive portal.
+3. Connect to that AP on your phone/laptop; browser opens captive portal.
 4. Enter your WiFi credentials so the device joins your Local Area Network.
-5. The device shows its IP address on the round display.
+5. The device shows its IP address and port on the round display.
 
-## Device Configuration (Extension Push)
+## Running
 
-1. Connect your computer to the same WiFi network as the device.
-2. Note the IP address displayed on the screen.
-3. Open the Claude Usage Monitor Chrome Extension **Settings**.
-4. Enter the device IP under "IoT Push Target" and click **Push to device**.
+1. Note the IP:port shown on the device display.
+2. Start the Rust daemon pointed at the device:
 
-The extension will read your active `sessionKey` cookie and Org UUID, and HTTP POST them directly over your local network to the ATOMS3R.
+```bash
+claude-usage-daemon --device-ip <IP> --api-key "your-shared-secret"
+```
 
-## Updating Credentials & WiFi
+The daemon pushes usage data every 5 minutes. The device renders color-coded progress bars and countdown timers between pushes. If no data is received for 10 minutes, a "STALE" indicator appears in orange.
 
-- **Session updates:** The Chrome extension automatically repushes the latest session cookie in the background whenever the browser is open.
-- **WiFi reset:** Hold the **built-in button** for 2 seconds to wipe WiFi settings and reboot into Access Point mode.
+## WiFi Reset
 
-## Security Note
-
-`setInsecure()` skips TLS cert validation. This is acceptable for a personal
-local widget, the data is non-sensitive usage stats on your own account.
+Hold the **built-in button** for 2 seconds to wipe WiFi settings and reboot into Access Point mode.
 
 ## Display Layout (128x128 round color)
 
 ```text
-       .--──────────────--.
-      /  CLAUDE USAGE 3:42p \
-     | ─────────────────────  |
-     |                        |
-     |  5HR           12.3%   |
-     |  ████████░░░░░░░░░░░   |
-     |  resets 4h 22m         |
-     |                        |
-     |  7DAY           34.5%  |
-     |  ██████████████░░░░░   |
-     |  resets 5d 11h         |
-     |                        |
-     |  synced 2m ago         |
-      \   192.168.1.42      /
-       '--──────────────--'
+       .--________________--.
+      /  CLAUDE USAGE 3:42p  \
+     | _______________________ |
+     |                         |
+     |  5HR            12.3%   |
+     |  ########_________      |
+     |  resets 4h 22m          |
+     |                         |
+     |  7DAY           34.5%   |
+     |  ##############___      |
+     |  resets 5d 11h          |
+     |                         |
+     |  synced 2m ago          |
+      \                      /
+       '--________________--'
 ```
 
 Progress bars are color-coded:
@@ -85,7 +93,6 @@ Progress bars are color-coded:
 | MCU | ESP8266 (160MHz single-core) | ESP32-S3 (240MHz dual-core) |
 | Display | SSD1306 0.96" OLED, 128x64, mono | GC9A01 0.85" IPS, 128x128, color |
 | Wiring | 4 wires (I2C) | None (self-contained) |
-| Storage | EEPROM (512 bytes, raw) | NVS Preferences (key-value) |
 | Flash | 4MB | 8MB |
 | RAM | 80KB | 512KB + 8MB PSRAM |
 | Build | Arduino IDE | PlatformIO |

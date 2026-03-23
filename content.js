@@ -1,38 +1,20 @@
 // Claude Usage Monitor - Content Script (isolated world)
-// Handles polling and communication with background.
+// Only detects the org ID. Background owns polling.
 // Fetch interception happens via injected.js in the main world.
 
 let orgId = null;
-let pollInterval = null;
-
-// --- Poll usage endpoint (same-origin, cookies auto-included) ---
-async function fetchUsage() {
-  if (!orgId) return;
-  try {
-    const res = await fetch(`/api/organizations/${orgId}/usage`, { credentials: 'include' });
-    if (!res.ok) return;
-    const data = await res.json();
-    chrome.runtime.sendMessage({ type: 'USAGE_DATA', data, timestamp: Date.now() });
-  } catch (e) {}
-}
-
-function startPolling() {
-  if (pollInterval) return;
-  fetchUsage();
-  pollInterval = setInterval(fetchUsage, 5 * 60 * 1000);
-}
 
 function setOrgId(id) {
-  if (orgId) return;
+  if (orgId === id) return;
   orgId = id;
   chrome.runtime.sendMessage({ type: 'SET_ORG_ID', orgId });
-  startPolling();
 }
 
 // --- Listen for org ID posted from injected main-world script ---
 window.addEventListener('message', (e) => {
   if (e.source !== window) return;
-  if (e.data?.type === 'CLAUDE_USAGE_ORG_ID' && e.data.orgId) {
+  if (e.data?.type === 'CLAUDE_USAGE_ORG_ID' && e.data.orgId
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(e.data.orgId)) {
     setOrgId(e.data.orgId);
   }
 });
@@ -52,7 +34,6 @@ async function init() {
 
   if (stored.orgId) {
     orgId = stored.orgId;
-    startPolling();
     return;
   }
 
@@ -64,8 +45,8 @@ async function init() {
 init();
 
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'POLL_NOW') fetchUsage();
-  if (msg.type === 'ORG_ID_UPDATED') { orgId = msg.orgId; startPolling(); }
+  if (msg.type === 'ORG_ID_UPDATED') {
+    orgId = msg.orgId;
+  }
   if (msg.type === 'AUTO_DETECT_ENABLED' && !orgId) injectInterceptor();
 });
-

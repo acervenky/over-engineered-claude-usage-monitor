@@ -10,11 +10,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('refresh-btn').addEventListener('click', async () => {
-    const [tab] = await chrome.tabs.query({ url: 'https://claude.ai/*' });
-    if (tab) {
-      chrome.tabs.sendMessage(tab.id, { type: 'POLL_NOW' }).catch(() => {});
-      setTimeout(() => window.location.reload(), 2000);
-    }
+    chrome.runtime.sendMessage({ type: 'POLL_NOW' }).catch(() => {});
+    setTimeout(() => window.location.reload(), 2000);
   });
 
   const data = await chrome.storage.local.get([

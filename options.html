@@ -56,13 +56,19 @@
     </section>
 
     <section>
-      <h2>IOT PUSH</h2>
-      <p class="desc">Push credentials directly to your NodeMCU over LAN. Session cookie is read automatically from your browser — no manual copy-paste needed.</p>
+      <h2>IOT DEVICE PUSH</h2>
+      <p class="desc">Push usage data to your hardware display over LAN. Uses HMAC-SHA256 challenge-response auth when supported, falling back to <code>X-API-Key</code> for older firmware. No credentials are sent to the device.</p>
 
       <div class="field">
         <label for="iot-endpoint">DEVICE IP</label>
-        <input type="text" id="iot-endpoint" placeholder="http://192.168.0.62" />
-        <div class="field-hint">IP shown on the OLED display after boot.</div>
+        <input type="text" id="iot-endpoint" placeholder="http://192.168.1.50" />
+        <div class="field-hint">IP:port shown on the device display after boot (default port 8080).</div>
+      </div>
+
+      <div class="field">
+        <label for="iot-api-key">DEVICE API KEY</label>
+        <input type="password" id="iot-api-key" placeholder="sup3rs3cr3t" spellcheck="false" />
+        <div class="field-hint">Must match <code>API_KEY</code> in firmware. Default: <code>sup3rs3cr3t</code>. Change in firmware + here if on a shared network.</div>
       </div>
 
       <div class="push-row">
@@ -71,10 +77,10 @@
       </div>
 
       <div class="field toggle-field" style="margin-top:14px">
-        <label for="iot-enabled">Auto-repush cookie on every poll</label>
+        <label for="iot-enabled">Auto-push usage data on every poll</label>
         <input type="checkbox" id="iot-enabled" />
       </div>
-      <div class="field-hint" style="margin-top:4px">Keeps the device in sync when your session cookie rotates. Recommended.</div>
+      <div class="field-hint" style="margin-top:4px">Pushes latest usage to the device every 5 minutes alongside badge updates.</div>
     </section>
 
     <section>
@@ -90,6 +96,7 @@
 
   </main>
 
+  <script src="iot-push.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

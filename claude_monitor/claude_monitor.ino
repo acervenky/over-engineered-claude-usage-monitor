@@ -1,10 +1,11 @@
 /*
  * Claude Usage Monitor — ESP8266 NodeMCU (ESP-12E)
  * Display: SSD1306 0.96" OLED, I2C
- *   SDA → D2 (GPIO4)
- *   SCL → D1 (GPIO5)
+ *   SDA -> D2 (GPIO4)
+ *   SCL -> D1 (GPIO5)
  *
- * Credentials pushed from Chrome extension — no manual config portal needed.
+ * Push-only display: receives usage data from the Rust daemon.
+ * No credentials stored, no outbound HTTPS. Device is a pure display.
  * Hold FLASH button 2s to reset WiFi only.
  *
  * Dependencies (Arduino Library Manager):
@@ -12,184 +13,76 @@
  *   - WiFiManager     (WiFi setup only)
  *   - ArduinoJson v6  (JSON parsing)
  *   - ESP8266WebServer (built-in with ESP8266 core)
- *   - ESP8266HTTPClient (built-in)
  */
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
-#include <WiFiClientSecureBearSSL.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
-#include <EEPROM.h>
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <time.h>
+#include <bearssl/bearssl_hmac.h>
 
-// ── OLED ──────────────────────────────────────────────────────────────────
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+// -- User config ----------------------------------------------------------
 
-// ── EEPROM layout ─────────────────────────────────────────────────────────
-#define EEPROM_SIZE      512
-#define ADDR_MAGIC       0    // 2 bytes
-#define ADDR_ORG_UUID    2    // 40 bytes
-#define ADDR_SESSION_KEY 42   // 460 bytes
-#define MAGIC_VAL        0xCA75
+// HTTP port the device listens on. Must match --device-port on the daemon.
+#define HTTP_PORT  8080
 
-// ── Config ────────────────────────────────────────────────────────────────
-#define POLL_INTERVAL_MS (5UL * 60 * 1000)
+// Shared API key. The daemon must send this in the X-API-Key header.
+// Change this to a unique value. Same key goes in the daemon's --api-key flag.
+#define API_KEY  "sup3rs3cr3t"
+
 #define NTP_SERVER       "pool.ntp.org"
-#define HTTP_PORT        80
 #define TZ_OFFSET_SEC    (5 * 3600 + 30 * 60)  // IST (UTC+5:30)
 
-// ── State ─────────────────────────────────────────────────────────────────
-struct UsageData {
-  float fiveHour     = -1;
-  float sevenDay     = -1;
-  long  fiveHourSecs = -1;
-  long  sevenDaySecs = -1;
-  unsigned long fetchedAt = 0;
-  bool  valid = false;
-};
+// Data is considered stale if no push received within this window.
+#define STALE_THRESHOLD_MS (10UL * 60 * 1000)  // 10 minutes
 
-char      gOrgUUID[40]     = {0};
-char      gSessionKey[460] = {0};
-UsageData gUsage;
-bool      gWifiOk          = false;
-unsigned long gLastPoll    = 0;
+// -- Platform type alias + server -----------------------------------------
+using MonitorWebServer = ESP8266WebServer;
+MonitorWebServer server(HTTP_PORT);
 
-ESP8266WebServer server(HTTP_PORT);
+// -- Shared logic (auth, handlers, time helpers) --------------------------
+#include "claude_monitor_common.h"
 
-// ── EEPROM helpers ────────────────────────────────────────────────────────
-void eepromWriteStr(int addr, const char* s, int maxLen) {
-  int i;
-  for (i = 0; i < maxLen - 1 && s[i]; i++) {
-    EEPROM.write(addr + i, s[i]);
+// -- Platform-specific: RNG (ESP8266 hardware register) -------------------
+const char* generateNonce() {
+  uint8_t raw[NONCE_HEX_LEN / 2];
+  for (size_t i = 0; i < sizeof(raw); i += 4) {
+    uint32_t r = RANDOM_REG32;
+    size_t remain = sizeof(raw) - i;
+    memcpy(raw + i, &r, remain < 4 ? remain : 4);
   }
-  EEPROM.write(addr + i, 0); // always write null terminator
+  hexEncode(raw, sizeof(raw), noncePool[nonceHead]);
+  const char* nonce = noncePool[nonceHead];
+  nonceHead = (nonceHead + 1) % NONCE_POOL_SIZE;
+  return nonce;
 }
 
-void eepromReadStr(int addr, char* buf, int maxLen) {
-  for (int i = 0; i < maxLen; i++) {
-    buf[i] = EEPROM.read(addr + i);
-    if (!buf[i]) break;
-  }
-  buf[maxLen - 1] = 0;
+// -- Platform-specific: HMAC-SHA256 via BearSSL ---------------------------
+void computeHmacSha256(const char* key, size_t keyLen,
+                       const uint8_t* data, size_t dataLen,
+                       uint8_t out[32]) {
+  br_hmac_key_context kc;
+  br_hmac_key_init(&kc, &br_sha256_vtable, key, keyLen);
+  br_hmac_context ctx;
+  br_hmac_init(&ctx, &kc, 0);
+  br_hmac_update(&ctx, data, dataLen);
+  br_hmac_out(&ctx, out);
 }
 
-bool credentialsSaved() {
-  uint16_t magic = (EEPROM.read(ADDR_MAGIC) << 8) | EEPROM.read(ADDR_MAGIC + 1);
-  return magic == MAGIC_VAL;
-}
+// -- OLED -----------------------------------------------------------------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+bool gWifiOk = false;
 
-void saveCredentials(const char* uuid, const char* key) {
-  EEPROM.write(ADDR_MAGIC,     (MAGIC_VAL >> 8) & 0xFF);
-  EEPROM.write(ADDR_MAGIC + 1, MAGIC_VAL & 0xFF);
-  eepromWriteStr(ADDR_ORG_UUID,    uuid, 40);
-  eepromWriteStr(ADDR_SESSION_KEY, key,  460);
-  EEPROM.commit();
-}
-
-void loadCredentials() {
-  eepromReadStr(ADDR_ORG_UUID,    gOrgUUID,    sizeof(gOrgUUID));
-  eepromReadStr(ADDR_SESSION_KEY, gSessionKey, sizeof(gSessionKey));
-}
-
-// ── CORS ──────────────────────────────────────────────────────────────────
-void addCORSHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin",  "*");
-  server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-// ── POST /configure ───────────────────────────────────────────────────────
-// Body: { "orgId": "...", "sessionKey": "sessionKey=..." }
-void handleConfigure() {
-  addCORSHeaders();
-  if (server.method() == HTTP_OPTIONS) { server.send(204); return; }
-
-  if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"error\":\"no body\"}");
-    return;
-  }
-
-  StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, server.arg("plain"))) {
-    server.send(400, "application/json", "{\"error\":\"invalid json\"}");
-    return;
-  }
-
-  const char* uuid = doc["orgId"];
-  const char* key  = doc["sessionKey"];
-
-  if (!uuid || strlen(uuid) != 36) {
-    server.send(400, "application/json", "{\"error\":\"invalid orgId\"}");
-    return;
-  }
-  if (!key || strlen(key) == 0) {
-    server.send(400, "application/json", "{\"error\":\"missing sessionKey\"}");
-    return;
-  }
-
-  saveCredentials(uuid, key);
-  loadCredentials();
-  server.send(200, "application/json", "{\"ok\":true}");
-
-  // Confirm on display briefly
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_5x7_tf);
-  u8g2.drawStr(10, 28, "configured!");
-  u8g2.drawStr(5, 42, "fetching data...");
-  u8g2.sendBuffer();
-
-  gLastPoll = 0; // trigger immediate poll on next loop
-}
-
-// ── GET /status ───────────────────────────────────────────────────────────
-void handleStatus() {
-  addCORSHeaders();
-  StaticJsonDocument<256> doc;
-  doc["configured"]    = credentialsSaved();
-  doc["orgId"]         = gOrgUUID;
-  doc["hasSessionKey"] = strlen(gSessionKey) > 0;
-  doc["fiveHour"]      = gUsage.fiveHour;
-  doc["sevenDay"]      = gUsage.sevenDay;
-  doc["valid"]         = gUsage.valid;
-  doc["ip"]            = WiFi.localIP().toString();
-  String out; serializeJson(doc, out);
-  server.send(200, "application/json", out);
-}
-
-void handleNotFound() {
-  addCORSHeaders();
-  server.send(404, "application/json", "{\"error\":\"not found\"}");
-}
-
-// ── Display ───────────────────────────────────────────────────────────────
+// -- Display --------------------------------------------------------------
 void drawBar(int x, int y, int w, int h, float pct) {
   u8g2.drawFrame(x, y, w, h);
   int fill = (int)((pct / 100.0f) * (w - 2));
   fill = max(0, min(fill, w - 2));
   if (fill > 0) u8g2.drawBox(x + 1, y + 1, fill, h - 2);
-}
-
-void formatCountdown(long secs, char* buf, int bufLen) {
-  if (secs <= 0) { snprintf(buf, bufLen, "ready"); return; }
-  long d = secs / 86400, h = (secs % 86400) / 3600, m = (secs % 3600) / 60;
-  if (d > 0)      snprintf(buf, bufLen, "resets %ldd %ldh", d, h);
-  else if (h > 0) snprintf(buf, bufLen, "resets %ldh %ldm", h, m);
-  else            snprintf(buf, bufLen, "resets %ldm", m);
-}
-
-void getTimeStr(char* buf, int bufLen) {
-  time_t now = time(nullptr);
-  struct tm* ti = localtime(&now);
-  if (ti->tm_year < 120) { snprintf(buf, bufLen, "--:--"); return; }
-  int h = ti->tm_hour;
-  const char* ampm = h >= 12 ? "p" : "a";
-  if (h == 0) h = 12; else if (h > 12) h -= 12;
-  snprintf(buf, bufLen, "%d:%02d%s", h, ti->tm_min, ampm);
 }
 
 void drawScreen() {
@@ -207,29 +100,35 @@ void drawScreen() {
     u8g2.setFont(u8g2_font_5x7_tf);
     if (!gWifiOk) {
       u8g2.drawStr(10, 35, "no wifi...");
-    } else if (!credentialsSaved()) {
-      char ipBuf[32];
-      snprintf(ipBuf, sizeof(ipBuf), "IP: %s", WiFi.localIP().toString().c_str());
-      u8g2.drawStr(0, 22, "waiting for config");
-      u8g2.drawStr(0, 34, "push from extension");
-      u8g2.setFont(u8g2_font_4x6_tf);
-      u8g2.drawStr(0, 46, ipBuf);
-      u8g2.drawStr(0, 56, "settings > IoT push");
     } else {
-      u8g2.drawStr(20, 32, "fetching...");
+      // Show IP:port and waiting message
+      char addrBuf[32];
+      snprintf(addrBuf, sizeof(addrBuf), "%s:%d",
+        WiFi.localIP().toString().c_str(), HTTP_PORT);
+      u8g2.drawStr(0, 22, "waiting for daemon");
+      u8g2.drawHLine(0, 25, 128);
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(0, 36, "connect daemon to:");
+      u8g2.setFont(u8g2_font_5x7_tf);
+      u8g2.drawStr(0, 48, addrBuf);
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(0, 60, "--device-ip <this IP>");
     }
     u8g2.sendBuffer();
     return;
   }
 
+  long elapsed = (long)(millisSinceReceived() / 1000);
+
+  // Staleness indicator
+  if (isStale()) {
+    u8g2.setFont(u8g2_font_4x6_tf);
+    u8g2.drawStr(60, 7, "[STALE]");
+  }
+
   // 5-hour
   char pct5[10], cd5[24];
   snprintf(pct5, sizeof(pct5), "%.1f%%", gUsage.fiveHour);
-  // Safe elapsed — handles millis() overflow after 49 days
-  unsigned long now = millis();
-  long elapsed = (long)((now >= gUsage.fetchedAt)
-    ? (now - gUsage.fetchedAt) / 1000
-    : (0xFFFFFFFFUL - gUsage.fetchedAt + now) / 1000);
   formatCountdown(gUsage.fiveHourSecs - elapsed, cd5, sizeof(cd5));
 
   u8g2.setFont(u8g2_font_5x7_tf);
@@ -259,68 +158,15 @@ void drawScreen() {
   u8g2.drawHLine(0, 54, 128);
   u8g2.setFont(u8g2_font_4x6_tf);
   char syncBuf[20];
-  long ageSecs = elapsed;
-  if (ageSecs < 60)        snprintf(syncBuf, sizeof(syncBuf), "synced just now");
-  else if (ageSecs < 3600) snprintf(syncBuf, sizeof(syncBuf), "synced %ldm ago", ageSecs / 60);
-  else                     snprintf(syncBuf, sizeof(syncBuf), "synced %ldh ago", ageSecs / 3600);
+  formatSyncAge(elapsed, syncBuf, sizeof(syncBuf));
   u8g2.drawStr(0, 63, syncBuf);
 
   u8g2.sendBuffer();
 }
 
-// ── Parse ISO8601 to seconds from now ─────────────────────────────────────
-// Assumes timestamps from the API are UTC. mktime() interprets as local
-// (IST per configTime), so we add TZ_OFFSET_SEC to compensate.
-long parseResetsAt(const char* iso) {
-  struct tm t = {};
-  sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d",
-    &t.tm_year, &t.tm_mon, &t.tm_mday,
-    &t.tm_hour, &t.tm_min, &t.tm_sec);
-  t.tm_year -= 1900; t.tm_mon -= 1;
-  time_t resetUtc = mktime(&t) + TZ_OFFSET_SEC;
-  return (long)(resetUtc - time(nullptr));
-}
-
-// ── Poll claude.ai ────────────────────────────────────────────────────────
-void pollUsage() {
-  if (strlen(gOrgUUID) == 0 || strlen(gSessionKey) == 0) return;
-
-  char url[128];
-  snprintf(url, sizeof(url),
-    "https://claude.ai/api/organizations/%s/usage", gOrgUUID);
-
-  BearSSL::WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("Cookie",     gSessionKey);
-  http.addHeader("User-Agent", "Mozilla/5.0 ClaudeUsageMonitor/1.0");
-  http.addHeader("Accept",     "application/json");
-  http.setTimeout(10000);
-
-  int code = http.GET();
-  if (code == 200) {
-    StaticJsonDocument<512> doc;
-    if (!deserializeJson(doc, http.getString())) {
-      gUsage.fiveHour     = doc["five_hour"]["utilization"]  | -1.0f;
-      gUsage.sevenDay     = doc["seven_day"]["utilization"]  | -1.0f;
-      const char* r5      = doc["five_hour"]["resets_at"];
-      const char* r7      = doc["seven_day"]["resets_at"];
-      gUsage.fiveHourSecs = r5 ? parseResetsAt(r5) : -1;
-      gUsage.sevenDaySecs = r7 ? parseResetsAt(r7) : -1;
-      gUsage.fetchedAt    = millis();
-      gUsage.valid        = true;
-    }
-  } else if (code == 401 || code == 403) {
-    gUsage.valid = false;
-  }
-  http.end();
-}
-
-// ── Setup ─────────────────────────────────────────────────────────────────
+// -- Setup ----------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(EEPROM_SIZE);
   u8g2.begin();
 
   // Boot screen
@@ -331,8 +177,6 @@ void setup() {
   u8g2.sendBuffer();
   delay(1000);
 
-  if (credentialsSaved()) loadCredentials();
-
   // WiFi
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_5x7_tf);
@@ -342,7 +186,6 @@ void setup() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
 
-  // Only show portal instructions if WiFiManager actually opens the AP
   wm.setAPCallback([](WiFiManager* wm) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_5x7_tf);
@@ -366,9 +209,9 @@ void setup() {
 
   gWifiOk = true;
 
+  // Keep DST disabled. parseResetsAt() relies on a fixed offset here.
   configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
 
-  // Wait up to 10s for time sync
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_5x7_tf);
   u8g2.drawStr(10, 32, "syncing time...");
@@ -379,37 +222,42 @@ void setup() {
     delay(200);
   }
 
-  // Show IP
+  // Show IP:port and connection instructions
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_5x7_tf);
-  u8g2.drawStr(0, 16, "WiFi connected!");
-  char ipBuf[32];
-  snprintf(ipBuf, sizeof(ipBuf), "%s", WiFi.localIP().toString().c_str());
-  u8g2.drawStr(0, 30, ipBuf);
+  u8g2.drawStr(0, 10, "WiFi connected!");
+  u8g2.drawHLine(0, 13, 128);
+  char addrBuf[32];
+  snprintf(addrBuf, sizeof(addrBuf), "%s:%d",
+    WiFi.localIP().toString().c_str(), HTTP_PORT);
+  u8g2.drawStr(0, 26, addrBuf);
   u8g2.setFont(u8g2_font_4x6_tf);
-  u8g2.drawStr(0, 44, "enter this IP in");
-  u8g2.drawStr(0, 52, "extension settings");
+  u8g2.drawStr(0, 40, "waiting for daemon...");
+  u8g2.drawStr(0, 52, "run: claude-usage-daemon");
+  u8g2.drawStr(0, 60, "  --device-ip <this IP>");
   u8g2.sendBuffer();
   delay(5000);
 
-  // Start web server
-  server.on("/configure", HTTP_POST,    handleConfigure);
-  server.on("/configure", HTTP_OPTIONS, handleConfigure);
-  server.on("/status",    HTTP_GET,     handleStatus);
+  // Collect auth headers so we can read them in handlers.
+  server.collectHeaders("X-API-Key", "X-Auth-Nonce", "X-Auth-Signature");
+
+  server.on("/usage",  HTTP_POST,    handleUsage);
+  server.on("/usage",  HTTP_OPTIONS, handleUsage);
+  server.on("/status", HTTP_GET,     handleStatus);
+  server.on("/ping",   HTTP_GET,     handlePing);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  if (credentialsSaved()) pollUsage();
   drawScreen();
 
   pinMode(0, INPUT_PULLUP);
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────
+// -- Loop -----------------------------------------------------------------
 void loop() {
   server.handleClient();
 
-  // FLASH button 2s → reset WiFi
+  // FLASH button 2s -> reset WiFi
   static unsigned long btnDown = 0;
   if (digitalRead(0) == LOW) {
     if (!btnDown) btnDown = millis();
@@ -428,15 +276,10 @@ void loop() {
   }
   gWifiOk = true;
 
-  static unsigned long lastDraw = 0;
-
-  if (millis() - gLastPoll >= POLL_INTERVAL_MS || gLastPoll == 0) {
-    gLastPoll = millis();
-    pollUsage();
-    drawScreen();
-    lastDraw = millis();
-  } else if (millis() - lastDraw >= 30000) {
-    lastDraw = millis();
+  // Redraw every 30s for countdown timer updates.
+  // lastDrawMs is reset by handleUsage() after push-triggered redraws.
+  if (millis() - lastDrawMs >= 30000) {
+    lastDrawMs = millis();
     drawScreen();
   }
 
