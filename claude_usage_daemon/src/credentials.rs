@@ -117,6 +117,7 @@ fn parse_credentials(json: &str) -> Result<OAuthCredentials, String> {
 }
 
 /// Build the legacy keychain service name (hash-suffixed, older CLI versions).
+#[cfg(target_os = "macos")]
 fn keychain_service_name_legacy(config_dir: &Path) -> String {
     let dir_str = config_dir.to_string_lossy();
     let hash = Sha256::digest(dir_str.as_bytes());
@@ -125,6 +126,7 @@ fn keychain_service_name_legacy(config_dir: &Path) -> String {
 }
 
 /// Current CLI uses plain service name without hash suffix.
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 #[cfg(target_os = "macos")]
