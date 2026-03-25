@@ -17,6 +17,7 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
@@ -26,10 +27,18 @@
 
 // -- User config ----------------------------------------------------------
 
-// WiFi access point name and password for first-boot setup.
-// Leave AP_PASS as nullptr for an open network (no password).
-#define AP_NAME  "ClaudeMonitor"
-#define AP_PASS  nullptr              // e.g. "mypassword" for WPA2
+// Fallback config portal AP. Only used when the device can't connect to
+// a saved network. You join this temporary AP to configure your real WiFi.
+// This is NOT your home network name -- pick something distinct.
+// Leave AP_PASS as nullptr for an open portal (no password).
+#define AP_NAME  "ClaudeMonitor-Setup"
+#define AP_PASS  nullptr
+
+// Optional Static IP configuration. Uncomment and set to use a static IP instead of DHCP.
+// Ensure you use commas, not dots, for the IP octets.
+// #define STATIC_IP 192, 168, 1, 100
+// #define STATIC_GW 192, 168, 1, 1
+// #define STATIC_SN 255, 255, 255, 0
 
 // HTTP port the device listens on. Must match --device-port on the daemon.
 #define HTTP_PORT  8080
@@ -38,18 +47,31 @@
 // Change this to a unique value. Same key goes in the daemon's --api-key flag.
 #define API_KEY  "sup3rs3cr3t"
 
-// Timezone offset from UTC in seconds. Used for NTP clock and countdown
-// timers. Both configTime() and parseResetsAt() depend on this value.
+// POSIX timezone string. Handles DST transitions automatically.
+// Pick one and uncomment, or write your own POSIX TZ string.
 //
-//   UTC-08:00  PST   US Pacific      (-8 * 3600)
-//   UTC-05:00  EST   US Eastern      (-5 * 3600)
-//   UTC+00:00  GMT/UTC               (0)
-//   UTC+01:00  CET   Central Europe  (1 * 3600)
-//   UTC+05:30  IST   India           (5 * 3600 + 30 * 60)
-//   UTC+09:00  JST   Japan/KST       (9 * 3600)
+// -- US --
+#define TIMEZONE  "CST6CDT,M3.2.0,M11.1.0"   // US Central
+// #define TIMEZONE  "EST5EDT,M3.2.0,M11.1.0"   // US Eastern
+// #define TIMEZONE  "MST7MDT,M3.2.0,M11.1.0"   // US Mountain
+// #define TIMEZONE  "PST8PDT,M3.2.0,M11.1.0"   // US Pacific
+// #define TIMEZONE  "MST7"                       // Arizona (no DST)
+// #define TIMEZONE  "HST10"                      // Hawaii (no DST)
 //
-// Note: standard time only, no automatic DST switching.
-#define TZ_OFFSET_SEC  (5 * 3600 + 30 * 60)  // IST (UTC+5:30)
+// -- Europe --
+// #define TIMEZONE  "GMT0BST,M3.5.0/1,M10.5.0"  // UK
+// #define TIMEZONE  "CET-1CEST,M3.5.0,M10.5.0/3" // Central Europe
+// #define TIMEZONE  "EET-2EEST,M3.5.0/3,M10.5.0/4" // Eastern Europe
+//
+// -- Asia / Oceania --
+// #define TIMEZONE  "IST-5:30"                   // India (no DST)
+// #define TIMEZONE  "JST-9"                      // Japan (no DST)
+// #define TIMEZONE  "KST-9"                      // Korea (no DST)
+// #define TIMEZONE  "CST-8"                      // China (no DST)
+// #define TIMEZONE  "AEST-10AEDT,M10.1.0,M4.1.0/3" // Australia Eastern
+//
+// -- Other --
+// #define TIMEZONE  "UTC0"                       // UTC (no DST)
 
 // NTP server for time sync
 #define NTP_SERVER  "pool.ntp.org"
@@ -85,6 +107,24 @@ void computeHmacSha256(const char* key, size_t keyLen,
   mbedtls_md_hmac_update(&ctx, data, dataLen);
   mbedtls_md_hmac_finish(&ctx, out);
   mbedtls_md_free(&ctx);
+}
+
+// -- WiFi disconnect reason tracking --------------------------------------
+// Captured by event handler so the AP callback can display why connection failed.
+volatile uint8_t lastDisconnectReason = 0;
+
+const char* wifiReasonStr(uint8_t reason) {
+  switch (reason) {
+    case 2:   return "auth expired";
+    case 3:   return "AP deauthed";
+    case 8:   return "left AP";
+    case 15:  return "4way handshake timeout";
+    case 16:  return "group key timeout";
+    case 201: return "AP not found";
+    case 202: return "wrong password";
+    case 203: return "assoc rejected";
+    default:  return nullptr;  // unknown, show raw code
+  }
 }
 
 // -- Display --------------------------------------------------------------
@@ -166,14 +206,34 @@ void drawScreen() {
   canvas.drawFastHLine(L, 28, W, CLR_LINE);
 
   if (!gUsage.valid) {
-    canvas.setTextColor(CLR_DIM);
     if (WiFi.status() != WL_CONNECTED) {
+      canvas.setTextColor(CLR_DIM);
       drawCentered(56, "no wifi...");
-    } else {
-      // Show IP:port and waiting message
+    } else if (gUsage.lastAuthFailMs != 0) {
+      // Daemon tried to push but auth failed
+      canvas.setTextColor(CLR_RED);
+      drawCentered(36, "AUTH FAILED");
+      canvas.drawFastHLine(L, 46, W, CLR_LINE);
+      canvas.setTextColor(CLR_DIM);
+      drawCentered(52, "check API_KEY");
+      drawCentered(62, "matches daemon");
+      canvas.drawFastHLine(L, 72, W, CLR_LINE);
+      canvas.setTextColor(CLR_TEXT);
       char addrBuf[24];
-      snprintf(addrBuf, sizeof(addrBuf), "%s",
-        WiFi.localIP().toString().c_str());
+      snprintf(addrBuf, sizeof(addrBuf), "%s", WiFi.localIP().toString().c_str());
+      drawCentered(80, addrBuf);
+    } else if (gUsage.daemonSeen) {
+      // Daemon pinged us but hasn't pushed data yet
+      canvas.setTextColor(CLR_GREEN);
+      drawCentered(36, "daemon found");
+      canvas.drawFastHLine(L, 46, W, CLR_LINE);
+      canvas.setTextColor(CLR_DIM);
+      drawCentered(56, "fetching data...");
+    } else {
+      // No contact from daemon yet
+      canvas.setTextColor(CLR_DIM);
+      char addrBuf[24];
+      snprintf(addrBuf, sizeof(addrBuf), "%s", WiFi.localIP().toString().c_str());
       char portBuf[12];
       snprintf(portBuf, sizeof(portBuf), "port %d", HTTP_PORT);
 
@@ -232,38 +292,91 @@ void setup() {
   delay(1000);
 
   // WiFi
-  showStatus(CLR_DIM, "connecting wifi...");
+  // Capture disconnect reason so we can display it if connection fails.
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    Serial.printf("WiFi disconnect reason: %d\n", lastDisconnectReason);
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
 
+  // Show which saved network we're attempting, or "no saved network"
+  {
+    wifi_config_t conf;
+    esp_wifi_get_config(WIFI_IF_STA, &conf);
+    const char* savedSSID = (const char*)conf.sta.ssid;
+    if (savedSSID[0] != '\0') {
+      canvas.fillSprite(CLR_BG);
+      canvas.setTextColor(CLR_DIM);
+      drawCentered(40, "connecting to");
+      canvas.setTextColor(CLR_TEXT);
+      drawCentered(54, savedSSID);
+      canvas.pushSprite(0, 0);
+    } else {
+      showStatus(CLR_DIM, "no saved network");
+    }
+  }
+
+#ifdef STATIC_IP
+  IPAddress ip(STATIC_IP);
+  IPAddress gw(STATIC_GW);
+  IPAddress sn(STATIC_SN);
+  wm.setSTAStaticIPConfig(ip, gw, sn);
+#endif
+
+  // This callback fires when autoConnect can't reach the saved network
+  // and falls back to hosting a config portal AP.
   wm.setAPCallback([](WiFiManager* wm) {
+    // Build human-readable reason string
+    char reasonBuf[28];
+    const char* known = wifiReasonStr(lastDisconnectReason);
+    if (lastDisconnectReason == 0) {
+      snprintf(reasonBuf, sizeof(reasonBuf), "no saved network");
+    } else if (known) {
+      snprintf(reasonBuf, sizeof(reasonBuf), "%s", known);
+    } else {
+      snprintf(reasonBuf, sizeof(reasonBuf), "error code %d", lastDisconnectReason);
+    }
+    Serial.printf("WiFi connect failed: %s\n", reasonBuf);
+
     canvas.fillSprite(CLR_BG);
-    canvas.setTextColor(CLR_TEXT);
-    drawCentered(16, "WIFI SETUP");
+    canvas.setTextColor(CLR_RED);
+    drawCentered(6, "CONNECT FAILED");
+    // Show why it failed
+    canvas.setTextColor(CLR_ORANGE);
+    drawCentered(16, reasonBuf);
     canvas.drawFastHLine(20, 26, 87, CLR_LINE);
     canvas.setTextColor(CLR_DIM);
-    drawCentered(32, "Connect to:");
+    drawCentered(30, "Join WiFi AP:");
     canvas.setTextColor(CLR_TEXT);
-    drawCentered(44, AP_NAME);
+    drawCentered(42, AP_NAME);
     if (AP_PASS) {
       canvas.setTextColor(CLR_DIM);
-      drawCentered(56, "pwd: see firmware");
+      drawCentered(54, "pwd: see firmware");
     }
     canvas.setTextColor(CLR_DIM);
-    drawCentered(AP_PASS ? 72 : 60, "then open");
-    drawCentered(AP_PASS ? 84 : 72, "192.168.4.1");
+    drawCentered(AP_PASS ? 68 : 58, "then open:");
+    canvas.setTextColor(CLR_TEXT);
+    drawCentered(AP_PASS ? 80 : 70, "192.168.4.1");
+    canvas.setTextColor(CLR_DIM);
+    drawCentered(AP_PASS ? 96 : 86, "to pick network");
     canvas.pushSprite(0, 0);
   });
 
   if (!wm.autoConnect(AP_NAME, AP_PASS)) {
-    showStatus(CLR_RED, "wifi failed");
-    delay(3000);
+    // Portal timed out with no config. Countdown then restart.
+    for (int i = 10; i > 0; i--) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "retry in %ds", i);
+      showStatus(CLR_RED, "wifi failed", buf);
+      delay(1000);
+    }
     ESP.restart();
   }
 
-  // Keep DST disabled. parseResetsAt() relies on a fixed offset here.
-  configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
+  // POSIX TZ string handles DST transitions automatically.
+  configTzTime(TIMEZONE, NTP_SERVER);
 
   showStatus(CLR_DIM, "syncing time...");
   unsigned long ntpStart = millis();
@@ -278,6 +391,14 @@ void setup() {
       WiFi.localIP().toString().c_str());
     char portBuf[12];
     snprintf(portBuf, sizeof(portBuf), "port %d", HTTP_PORT);
+
+    Serial.println();
+    Serial.println("===============================");
+    Serial.print("WiFi connected! IP: ");
+    Serial.println(addrBuf);
+    Serial.print("Listening on HTTP port: ");
+    Serial.println(HTTP_PORT);
+    Serial.println("===============================");
 
     canvas.fillSprite(CLR_BG);
     canvas.setTextColor(CLR_GREEN);

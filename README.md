@@ -1,381 +1,359 @@
-<div align="center">
-
 # Claude Usage Monitor
 
-### *Hyper-Local Token Telemetry for the Over-Engineered*
-
-A three-part system that tracks your Claude.ai usage limits in real time and renders them on a dedicated hardware desk widget. A Rust daemon reads your Claude CLI OAuth credentials, polls the usage API, and pushes data over your LAN to an ESP8266 or M5Stack ATOMS3R display. A standalone Chrome extension provides in-browser heatmaps and stats without any hardware.
-
-<br>
-
-<img src="./docs/images/PXL_20260319_172247625.jpg" alt="OLED Hardware Display Hero" width="800">
-
-<br>
-
-<em>Exactly what you need to see, without turning the monitor on.</em>
-
-<br><br>
-
----
-
-**Part of the *Over Engineered by Venky* Series**
-
-> *Welcome to "Over Engineered by Venky", a growing collection of projects where the solution is gloriously, unapologetically disproportionate to the problem. Need to know how many Claude messages you have left? Sure, you could just wait for the "x messages remaining until y time" banner to appear, or try to guess your rolling 5-hour window. But why guess? Instead, you can build a Rust daemon that reads OAuth tokens from your macOS Keychain, polls Anthropic's API every 5 minutes, and pushes the telemetry over your local network to a microcontroller driving a dedicated display on your desk. Every project in this series exists because "but I could over-engineer that with data" is a lifestyle, not a suggestion. Efficiency? Optional. Style points? Mandatory.*
-
----
-
-[![Status](https://img.shields.io/badge/Status-Actively_Monitoring-brightgreen?style=for-the-badge)](#)
-[![Data](https://img.shields.io/badge/Data-OAuth_API-blue?style=for-the-badge)](#)
-[![Daemon](https://img.shields.io/badge/Daemon-Rust-orange?style=for-the-badge)](#)
-[![Extension](https://img.shields.io/badge/Frontend-MV3_Vanilla_JS-blue?style=for-the-badge)](#)
-[![Edge](https://img.shields.io/badge/Edge-ESP8266_+_OLED-orange?style=for-the-badge)](#)
-[![Edge V2](https://img.shields.io/badge/Edge_V2-ATOMS3R_Color_LCD-purple?style=for-the-badge)](#)
-[![Firmware](https://img.shields.io/badge/Firmware-Arduino_C++-red?style=for-the-badge)](#)
-
-</div>
-
----
-
-## Background
-
-It started with Claude's invisible usage limits. Whether you're on a Free account hitting your daily ceiling or a Pro user micromanaging a 5-hour rolling message window and a 7-day cap, the problem is identical: there is no persistent usage meter. Just a vague sense of dread and an abrupt banner telling you that you've been cut off until 4 PM.
-
-<br>
+Real-time Claude.ai usage tracking on a dedicated hardware desk widget. A Rust daemon reads your Claude CLI OAuth credentials, polls the Anthropic usage API, and pushes utilization data over LAN to an ESP8266 or M5Stack ATOMS3R display. A standalone Chrome extension provides in-browser monitoring without any hardware.
 
 <div align="center">
-<img src="./docs/images/rate_limit.png" alt="Claude rate limit banner on chat UI" width="600">
-<br>
-<em>The Inciting Incident: The dreaded native chat UI banner that made a hardware desk widget necessary.</em>
+<img src="./docs/images/PXL_20260319_172247625.jpg" alt="ESP8266 OLED display showing Claude usage" width="700">
 </div>
 
-<br>
-
-**The Plan:** Build a lightweight Rust daemon that reads OAuth credentials from the Claude CLI's keychain storage, polls Anthropic's usage API every 5 minutes, and pushes the results to a dedicated hardware display over your LAN. No browser required. No credentials on the device. The Chrome extension remains fully standalone for in-browser monitoring.
-
-**The Dataset:** Two utilization windows. Per-model breakdowns. Color-coded progress bars. One hour-by-hour operational heatmap. API key-authenticated device push.
-
 ---
 
-## The Problem vs. The Over-Engineered Solution
+## Table of Contents
 
-| | The Normal Solution | The Venky Solution |
-|---|---|---|
-| **Monitoring** | Wait for the warning banner to pop up. | Run a Rust daemon that reads OAuth tokens from your macOS Keychain and polls the API. |
-| **Tracking** | Try to remember when you sent your last message. | Poll `api.anthropic.com/api/oauth/usage` every 5 minutes and push to hardware. |
-| **Pacing** | Just type less. | Receive system notifications and view an hourly heatmap spanning the last 14 days. |
-| **Off-Screen** | Open a new tab to check Claude. | Drive a 0.96" OLED or a color round LCD on your desk with real-time cooldowns. |
-| **Auth** | Refresh the page and log in. | The daemon reads tokens from keychain, refreshes them automatically, and the device stores zero secrets. |
-
----
-
-## Architecture
-
-The system has three independent layers. Use any combination.
-
-```mermaid
-graph TD
-    subgraph Keychain ["macOS Keychain / ~/.claude/.credentials.json"]
-        Creds["OAuth Tokens<br/>(written by Claude CLI)"]
-    end
-
-    subgraph Daemon ["Rust Daemon (claude-usage-daemon)"]
-        direction TB
-        Read["Read OAuth tokens"]
-        Fetch["GET api.anthropic.com<br/>/api/oauth/usage"]
-        Refresh["Refresh token<br/>platform.claude.com/v1/oauth/token"]
-        Push["POST http://device:8080/usage<br/>HMAC-SHA256 auth"]
-    end
-
-    subgraph Browser ["Chrome Extension (MV3)"]
-        direction TB
-        Inject["injected.js (Main World)<br/>Intercepts Org UUID"]
-        SW["background.js (Service Worker)<br/>5-min Polling Alarm"]
-        UI["popup.js / popup.html<br/>Heatmap & Stats UI"]
-
-        Inject -->|UUID via messaging| SW
-        SW <-->|Polls /usage| UI
-    end
-
-    subgraph DeskWidget ["Edge Device (pick one)"]
-        direction TB
-        Node["NodeMCU ESP-12E<br/>Pure display, port 8080"]
-        OLED["SSD1306 0.96 OLED<br/>Monochrome"]
-        Atom["M5Stack ATOMS3R<br/>Pure display, port 8080"]
-        RoundLCD["GC9A01 0.85 IPS<br/>Color, Round"]
-
-        Node -->|I2C| OLED
-        Atom -->|Built-in| RoundLCD
-    end
-
-    Creds --> Read
-    Read --> Fetch
-    Fetch --> Push
-    Read -.->|if expired| Refresh
-    Refresh -.-> Creds
-    Push -->|LAN HTTP| Node
-    Push -->|LAN HTTP| Atom
-    SW -->|HTTPS GET claude.ai| SW
-```
-
-**Key design decisions:**
-
-- **Device stores zero secrets.** No credentials, no HTTPS client, no outbound connections. Pure display.
-- **Daemon handles all auth.** Reads Keychain (macOS) or credentials file (Linux/Windows). Refreshes tokens. Pushes pre-parsed data.
-- **HMAC auth on LAN.** Device uses HMAC-SHA256 challenge-response so the raw API key never crosses the wire. See [Security](docs/SECURITY.md).
-- **Chrome extension is independent.** Badge, heatmap, and stats work without daemon or hardware.
-
-> For a deep dive on how usage data is retrieved (and why API keys don't work), see [How Usage Data Is Retrieved](docs/HOW_USAGE_DATA_WORKS.md).
-
----
-
-## The Hardware: Edge Display on a Budget
-
-### Variant A: ESP8266 + OLED (Original)
-
-The breadboard build. Four wires, two components, zero elegance.
-
-| # | Component | Role | Cost |
-|---|-----------|------|------|
-| 1 | **NodeMCU ESP-12E** | WiFi-enabled ESP8266 board. Receives data over HTTP, displays on OLED. | ~350 |
-| 2 | **0.96" SSD1306** | I2C OLED display. Renders usage bars and reset timers in monochrome. | ~200 |
-| | | **Total** | **~550** |
-
-### Variant B: M5Stack ATOMS3R (New)
-
-The self-contained build. No wiring, no breadboard, no excuses. Plug in USB-C and go.
-
-| # | Component | Role | Cost |
-|---|-----------|------|------|
-| 1 | **M5Stack ATOMS3R (C126)** | ESP32-S3 with built-in 0.85" round color IPS LCD (128x128), 8MB flash, 8MB PSRAM, button, WiFi. Everything in a 24x24x13mm package. | ~$8 |
-
-**What you get over the ESP8266 build:**
-- Color-coded progress bars (green/yellow/red by utilization)
-- No soldering or wiring, the display is built in
-- 30x more RAM, dual-core processor
-- Round display that looks like a purpose-built gauge
-- USB-C (no more micro-USB fumbling)
-
----
-
-## Dashboard Showcase
-
-*(An over-engineered project requires an overly dense presentation format.)*
-
-<div align="center">
-
-<table>
-  <tr>
-    <td align="center"><img src="./docs/images/exten.png" alt="Claude Usage Popup" width="350"></td>
-    <td align="center"><img src="./docs/images/settings.png" alt="Claude Usage Settings" width="350"></td>
-  </tr>
-  <tr>
-    <td align="center"><em>The Extension: 14-day heatmap, daily averages, and rolling limits</em></td>
-    <td align="center"><em>The Core Config: Target IPs, Goal Thresholds, and Push Triggers</em></td>
-  </tr>
-</table>
-
-</div>
+- [Quick Start](#quick-start)
+- [Requirements](#requirements)
+- [Daemon (Rust)](#daemon-rust)
+- [Hardware: M5Stack ATOMS3R](#hardware-m5stack-atoms3r)
+- [Hardware: ESP8266 + OLED](#hardware-esp8266--oled)
+- [WiFi Setup (Both Devices)](#wifi-setup-both-devices)
+- [Chrome Extension](#chrome-extension)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [License](#license)
 
 ---
 
 ## Quick Start
 
-### 1. The Daemon (Rust)
-
-The daemon reads OAuth credentials from the Claude CLI and pushes usage data to the hardware widget. Requires [Rust](https://rustup.rs/) and a working `claude` CLI login.
+The interactive setup script handles daemon installation, startup services, firmware dependencies, building, and flashing.
 
 ```bash
-# Build
+./setup.sh
+```
+
+It shows a status dashboard with detection indicators for installed tools and components, then presents a menu:
+
+```
+1) Install daemon binary       5) Uninstall startup service
+2) Uninstall daemon binary     6) Install firmware dependencies
+3) Install startup service     7) Build firmware
+4) Change device host IP       8) Flash firmware
+                               9) Quit
+```
+
+Non-interactive usage:
+
+```bash
+./setup.sh --install-daemon                            # download prebuilt binary
+./setup.sh --install-service --device-host 192.168.1.50  # set up auto-start
+./setup.sh --status                                    # show dashboard only
+```
+
+The general flow:
+
+1. Install the daemon (prebuilt binary or build from source).
+2. Flash firmware to your hardware device.
+3. Configure WiFi on the device via captive portal.
+4. Point the daemon at the device IP shown on the display.
+
+---
+
+## Requirements
+
+### Software
+
+| Tool | Used for | Install |
+|------|----------|---------|
+| [Rust](https://rustup.rs/) 1.70+ | Building the daemon from source (not needed for prebuilt binaries) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| [PlatformIO](https://platformio.org/) | Building and flashing ATOMS3R firmware | macOS: `brew install platformio`, Linux: `pip3 install platformio` |
+| [arduino-cli](https://arduino.github.io/arduino-cli/) | Building and flashing ESP8266 firmware | macOS: `brew install arduino-cli`, Linux: [install script](https://arduino.github.io/arduino-cli/installation/) |
+| Claude CLI | OAuth token source (run `claude` and log in) | See [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code) |
+
+### Platform Support
+
+| Platform | Daemon | Firmware flashing |
+|----------|--------|-------------------|
+| macOS (x86_64, arm64) | Yes | Yes |
+| Linux (x86_64, aarch64) | Yes | Yes |
+| Windows | Not supported | Not supported |
+
+### Hardware
+
+Pick one display device:
+
+| Device | Cost | Wiring | Display |
+|--------|------|--------|---------|
+| [**M5Stack ATOMS3R**](https://www.amazon.com/dp/B0F1X6JSBL) (recommended) | ~$20 | None (self-contained, USB-C) | 0.85" round color IPS, 128x128 |
+| **NodeMCU ESP-12E** + SSD1306 OLED | ~$5.50 | 4 wires (I2C) | 0.96" monochrome, 128x64 |
+
+---
+
+## Daemon (Rust)
+
+The daemon reads OAuth tokens written by the Claude CLI, polls `api.anthropic.com/api/oauth/usage` every 5 minutes, and pushes the results to your hardware device over LAN HTTP.
+
+### Install
+
+**Prebuilt binary** (no Rust needed):
+
+```bash
+./setup.sh --install-daemon
+```
+
+This downloads the correct binary for your OS and architecture to `~/.local/bin/`.
+
+**Build from source:**
+
+```bash
 cd claude_usage_daemon
 cargo build --release
-
-# Or use make from the project root
-make daemon
 ```
 
-**Prerequisites:** Log in to Claude CLI first so OAuth tokens exist:
+Binary: `claude_usage_daemon/target/release/claude-usage-daemon`
+
+See [claude_usage_daemon/README.md](claude_usage_daemon/README.md) for full daemon documentation.
+
+### Run
 
 ```bash
-claude  # follow the login prompt; this writes tokens to Keychain / ~/.claude/.credentials.json
+claude-usage-daemon --device-host 192.168.1.50
 ```
 
-**Run in foreground** (ctrl+c to stop, errors printed to stderr):
+All options:
+
+```
+-H, --device-host <HOST>   Required. Device IP or hostname.
+-p, --device-port <PORT>   Device port. Default: 8080.
+-k, --api-key <KEY>        Shared secret (must match firmware). Default: sup3rs3cr3t.
+-n, --interval <SECS>      Poll interval in seconds (min 10). Default: 300.
+-c, --config-dir <DIR>     Claude config directory. Default: ~/.claude.
+-d, --daemon               Fork to background (Unix only).
+-f, --pid-file <PATH>      PID file path. Default: $TMPDIR/claude-usage-daemon.pid.
+```
+
+### Auto-Start
+
+Use the setup script to configure a startup service:
 
 ```bash
-./target/release/claude-usage-daemon \
-  --device-ip 192.168.1.50 \
-  --api-key "your-shared-secret"
+./setup.sh --install-service --device-host 192.168.1.50
 ```
 
-**Run as background daemon** (Unix only):
+This installs a launchd plist (macOS) or systemd user service (Linux) that starts the daemon on login. Manage it later with:
 
 ```bash
-./target/release/claude-usage-daemon \
-  --device-ip 192.168.1.50 \
-  --api-key "your-shared-secret" \
-  --daemon
+./setup.sh --change-host 192.168.1.100   # update device IP
+./setup.sh --uninstall-service            # remove auto-start
 ```
 
-**All options:**
+### Credentials
 
-```
---device-ip <IP>       Required. LAN IP of the hardware widget.
---device-port <PORT>   Port the device listens on. Default: 8080.
---api-key <KEY>        Required. Must match API_KEY in firmware.
---interval <SECS>      Poll interval in seconds. Default: 300 (5 min).
---config-dir <DIR>     Override Claude config directory. Default: ~/.claude.
---daemon               Run as background daemon (Unix only).
---pid-file <PATH>      PID file path. Default: /tmp/claude-usage-daemon.pid.
-```
+The daemon reads OAuth tokens from the Claude CLI. Run `claude` and complete the login prompt before first use.
 
-**launchd (macOS auto-start):**
+| Platform | Primary source | Fallback |
+|----------|---------------|----------|
+| macOS | Keychain (`Claude Code-credentials`) | `~/.claude/.credentials.json` |
+| Linux | -- | `~/.claude/.credentials.json` |
+
+Tokens are refreshed automatically when they expire. The daemon never stores or transmits your OAuth credentials to the hardware device. It only pushes pre-parsed usage percentages.
+
+For details on how usage data is retrieved and why API keys cannot be used, see [How Usage Data Works](docs/HOW_USAGE_DATA_WORKS.md).
+
+---
+
+## Hardware: M5Stack ATOMS3R
+
+Self-contained build. No wiring, no breadboard. Plug in USB-C and go.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center"><img src="./docs/images/atoms3r_running.png" alt="ATOMS3R displaying usage data" width="300"></td>
+    <td align="center"><img src="./docs/images/atoms3r_waiting.png" alt="ATOMS3R waiting for daemon" width="300"></td>
+  </tr>
+  <tr>
+    <td align="center"><em>Receiving usage data: color-coded bars and countdown timers</em></td>
+    <td align="center"><em>After WiFi connect: waiting for first daemon push</em></td>
+  </tr>
+</table>
+</div>
+
+**Hardware:** [M5Stack ATOMS3R](https://www.amazon.com/dp/B0F1X6JSBL) (C126). ESP32-S3 dual-core, 0.85" round color IPS LCD (128x128), 8MB flash, 8MB PSRAM, built-in button, USB-C.
+
+**Firmware location:** `claude_monitor_atoms3r/`
+
+### Flash
+
+Requires PlatformIO. Connect the ATOMS3R via USB-C.
 
 ```bash
-# Edit the plist to set your device IP and API key
-cp claude_usage_daemon/resources/com.claude.usage-daemon.plist ~/Library/LaunchAgents/
-# Edit ~/Library/LaunchAgents/com.claude.usage-daemon.plist with your values
-launchctl load ~/Library/LaunchAgents/com.claude.usage-daemon.plist
+# Via setup script
+./setup.sh    # choose option 8, then ATOMS3R
+
+# Via make
+make flash-atoms3r
+
+# Manual
+cd claude_monitor_atoms3r && pio run -e atoms3r -t upload
 ```
 
-**Credential sources (priority order):**
+After flashing, the device reboots and creates a WiFi access point called **ClaudeMonitor-Setup**. Connect to it from your phone or laptop, select your WiFi network in the captive portal, and the device joins your network. See [WiFi Setup](#wifi-setup-both-devices) for the full walkthrough.
 
-| Platform | Primary | Fallback |
-|----------|---------|----------|
-| macOS | Keychain (service: `Claude Code-credentials-{hash}`) | `~/.claude/.credentials.json` |
-| Linux | N/A | `~/.claude/.credentials.json` |
-| Windows | N/A | `%USERPROFILE%\.claude\.credentials.json` |
+The firmware ships with a default API key (`sup3rs3cr3t`) that matches the daemon's default. You do not need to change it unless you want a unique key for a shared network, in which case you must set it in both the firmware and the daemon (`--api-key` flag). To customize, edit `claude_monitor_atoms3r/src/main.cpp` before flashing:
 
-### 2. The Chrome Extension (Standalone)
-
-The extension works entirely independently. No daemon or hardware required.
-
-1. Clone or download this repository.
-2. Go to `chrome://extensions`, enable **Developer Mode**, click **Load Unpacked**.
-3. Point it to the repository root (where `manifest.json` lives).
-4. Open `claude.ai`. Your Org ID is auto-detected on the first API call.
-5. The badge shows your 5-hour utilization percentage.
-
-### Firmware Dependencies
-
-Use `make setup` to install everything at once, or follow the manual steps below.
-
-<details>
-<summary><strong>ESP8266 (arduino-cli)</strong></summary>
-
-**macOS:**
-
-```bash
-brew install arduino-cli
-make setup-esp8266
+```c
+#define API_KEY   "your-custom-key"                 // must match daemon --api-key
+#define TIMEZONE  "CST6CDT,M3.2.0,M11.1.0"         // POSIX TZ string for your timezone
 ```
 
-**Linux (Debian/Ubuntu):**
+### WiFi Reset
+
+Hold the built-in button for 2 seconds to wipe saved WiFi credentials and reboot into setup mode.
+
+See [claude_monitor_atoms3r/README.md](claude_monitor_atoms3r/README.md) for hardware specs, display layout, and WiFi troubleshooting.
+
+---
+
+## Hardware: ESP8266 + OLED
+
+The breadboard build. Four wires, two components.
+
+**Hardware:**
+- NodeMCU ESP-12E (ESP8266)
+- SSD1306 0.96" OLED (I2C, 128x64, monochrome)
+
+**Wiring:**
+
+| OLED Pin | NodeMCU Pin |
+|----------|-------------|
+| VCC | 3V3 |
+| GND | GND |
+| SDA | D2 (GPIO4) |
+| SCL | D1 (GPIO5) |
+
+**Firmware location:** `claude_monitor/`
+
+### Flash
+
+Requires arduino-cli with the ESP8266 board core and libraries installed.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-sudo mv bin/arduino-cli /usr/local/bin/
-make setup-esp8266
-```
+# Install dependencies (one-time)
+./setup.sh    # choose option 6, then ESP8266
 
-**Manual (without make):**
+# Flash
+./setup.sh    # choose option 8, then ESP8266
 
-```bash
-arduino-cli core update-index --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
-arduino-cli core install esp8266:esp8266 --additional-urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
-arduino-cli lib install U8g2 WiFiManager "ArduinoJson@6"
-```
-
-</details>
-
-<details>
-<summary><strong>ATOMS3R (PlatformIO)</strong></summary>
-
-**macOS:**
-
-```bash
-brew install platformio
-```
-
-**Linux:**
-
-```bash
-pip install platformio
-# or: curl -fsSL -o get-platformio.py https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py && python3 get-platformio.py
-```
-
-PlatformIO handles board packages and libraries automatically via `platformio.ini`.
-
-</details>
-
-### Serial Port
-
-The Makefile auto-detects the serial port per OS:
-
-| OS    | Default                              |
-|-------|--------------------------------------|
-| macOS | `/dev/cu.usbserial*`                 |
-| Linux | `/dev/ttyUSB*` or `/dev/ttyACM*`     |
-
-If detection fails (or you have multiple devices), override it:
-
-```bash
-make flash-esp8266 SERIAL_PORT=/dev/ttyUSB0
-```
-
-### 3a. IoT Widget: ESP8266 (requires wiring)
-
-1. Wire your OLED to the NodeMCU (`VCC` to `3V3`, `GND` to `GND`, `SDA` to `D2`, `SCL` to `D1`).
-2. **Edit `claude_monitor/claude_monitor.ino`**: set `API_KEY` to your shared secret and adjust `TZ_OFFSET_SEC` for your timezone.
-3. Flash:
-
-```bash
+# Or via make
+make setup-esp8266   # one-time
 make flash-esp8266
 ```
 
-4. The device spins up a **ClaudeMonitor** access point. Connect to it, go to `192.168.4.1`, enter your WiFi details.
-5. The display shows the device's IP and port. Start the daemon pointed at that address.
+The Makefile auto-detects the serial port. Override if needed: `make flash-esp8266 SERIAL_PORT=/dev/ttyUSB0`
 
-### 3b. IoT Widget: M5Stack ATOMS3R (no wiring)
+After flashing, the device reboots and creates a WiFi access point called **ClaudeMonitor-Setup**. Connect to it from your phone or laptop, select your WiFi network in the captive portal, and the device joins your network. See [WiFi Setup](#wifi-setup-both-devices) for the full walkthrough.
 
-1. **Edit `claude_monitor_atoms3r/src/main.cpp`**: set `API_KEY` to your shared secret and adjust `TZ_OFFSET_SEC`.
-2. Flash:
+The firmware ships with a default API key (`sup3rs3cr3t`) that matches the daemon's default. You do not need to change it unless you want a unique key for a shared network, in which case you must set it in both the firmware and the daemon (`--api-key` flag). To customize, edit `claude_monitor/claude_monitor.ino` before flashing:
 
-```bash
-make flash-atoms3r
+```c
+#define API_KEY   "your-custom-key"       // must match daemon --api-key
+#define TIMEZONE  "IST-5:30"              // POSIX TZ string for your timezone
 ```
 
-3. The device spins up a **ClaudeMonitor** access point. Connect, enter WiFi details.
-4. The display shows its IP and port. Start the daemon.
+### WiFi Reset
 
-### Putting it together
+Hold the FLASH button (GPIO0) for 2 seconds to wipe saved WiFi credentials and reboot into setup mode.
+
+See [README_firmware.md](README_firmware.md) for pin reference and display layout.
+
+---
+
+## WiFi Setup (Both Devices)
+
+Neither device stores WiFi credentials in firmware. After flashing, WiFi is configured via a captive portal:
+
+1. On first boot, the device creates a temporary AP called **ClaudeMonitor-Setup** (open, no password).
+2. Join that network from your phone or laptop.
+3. A captive portal opens automatically (or browse to `192.168.4.1`).
+4. Select your **2.4 GHz** WiFi network and enter the password.
+5. The device saves credentials to flash, reboots, and connects via DHCP.
+6. The display shows the assigned IP address and listening port (default 8080).
+
+Credentials persist across reboots. To reconfigure, hold the reset button for 2 seconds (FLASH button on ESP8266, built-in button on ATOMS3R).
+
+Once connected, start the daemon pointed at the displayed IP:
 
 ```bash
-# 1. Flash the device (pick one)
-make flash-esp8266    # or make flash-atoms3r
-
-# 2. Note the IP:port shown on the device display (e.g., 192.168.1.50:8080)
-
-# 3. Build and run the daemon
-make daemon
-./target/release/claude-usage-daemon \
-  --device-ip 192.168.1.50 \
-  --api-key "your-shared-secret"
+claude-usage-daemon --device-host <IP_FROM_DISPLAY>
 ```
 
-The daemon polls every 5 minutes and pushes usage data. The device shows countdown timers that tick between pushes. If the daemon stops, the device shows a "STALE" indicator after 10 minutes.
+If no data is received for 10 minutes, the device shows a STALE indicator.
 
-### How data reaches the device
+---
 
-There are two independent ways to push usage data to the hardware display. Use whichever fits your setup.
+## Chrome Extension
 
-| Path | How it works | Best for |
-|------|-------------|----------|
-| **Rust Daemon** | Reads OAuth tokens from Keychain/file, polls `api.anthropic.com/api/oauth/usage`, pushes `POST /usage` with HMAC auth to device over LAN. Runs headless. | Always-on monitoring without a browser. |
-| **Chrome Extension** | Polls `claude.ai/api/organizations/{orgId}/usage` using session cookies, pushes `POST /usage` with HMAC auth to device on every poll. Configure in extension Settings > IoT Device Push. | Browser-based monitoring with hardware display. |
+The Chrome extension monitors Claude usage independently. No daemon or hardware required. It can also push data to a hardware device if configured.
 
-Both paths use the same device protocol (`POST /usage` with HMAC-SHA256 challenge-response), so you can switch between them or even run both (the device just displays the last push it received). See [Security](docs/SECURITY.md) for auth details.
+<div align="center">
+<img src="./docs/images/exten.png" alt="Chrome extension popup showing usage heatmap" width="350">
+</div>
 
-If you only want in-browser monitoring (badge, heatmap, notifications), the Chrome extension works without any hardware or daemon.
+### Install
+
+1. Clone or download this repository.
+2. Open `chrome://extensions` in Chrome.
+3. Enable **Developer Mode** (top right toggle).
+4. Click **Load unpacked** and select the repository root (where `manifest.json` is).
+5. Open [claude.ai](https://claude.ai). The extension auto-detects your organization ID on the first API call.
+
+### Features
+
+- **Badge:** Shows 5-hour utilization percentage. Color-coded green/amber/red.
+- **Popup:** 14-day hourly heatmap, daily averages, reset countdown timers.
+- **Notifications:** Alert when utilization hits 90% with more than 1 hour remaining in the window.
+- **CSV export:** Download usage history from the popup.
+- **IoT push:** Optionally push usage data to a hardware device on every poll (configure in Settings > IoT Device Push).
+
+### Settings
+
+<div align="center">
+<img src="./docs/images/settings.png" alt="Chrome extension settings page" width="400">
+</div>
+
+Configure the 5-hour usage goal (default 50%), pace notifications, and hardware device push (IP, API key, auto-push toggle).
+
+### How It Works
+
+The extension uses browser session cookies (you must be logged into claude.ai) to poll `claude.ai/api/organizations/{orgId}/usage` every 5 minutes. No OAuth tokens or API keys are needed. See [How Usage Data Works](docs/HOW_USAGE_DATA_WORKS.md) for details.
+
+---
+
+## Architecture
+
+```
+Claude CLI (OAuth login)
+        |
+        v
+macOS Keychain / ~/.claude/.credentials.json
+        |
+        v
+Rust Daemon (claude-usage-daemon)
+  1. Read OAuth tokens
+  2. GET api.anthropic.com/api/oauth/usage
+  3. Refresh tokens if expired
+  4. POST http://device:8080/usage (HMAC-SHA256 auth)
+        |
+        v
+Hardware Device (ESP8266 or ATOMS3R)
+  - Passive HTTP server on LAN
+  - Displays usage bars and countdowns
+  - Stores zero credentials
+```
+
+The Chrome extension operates independently through the browser, using session cookies instead of OAuth tokens. Both the daemon and the extension can push to the same hardware device using the same `POST /usage` protocol with [HMAC-SHA256 authentication](docs/SECURITY.md).
+
+For a detailed breakdown of authentication, API endpoints, and data formats, see [How Usage Data Works](docs/HOW_USAGE_DATA_WORKS.md).
 
 ---
 
@@ -384,110 +362,44 @@ If you only want in-browser monitoring (badge, heatmap, notifications), the Chro
 ```
 .
 ├── claude_usage_daemon/           # Rust daemon
-│   ├── Cargo.toml                 # Dependencies and build config
+│   ├── Cargo.toml
 │   ├── src/
-│   │   ├── main.rs                # CLI args, poll loop, daemon/foreground modes
-│   │   ├── credentials.rs         # Keychain + file reading, token refresh
-│   │   ├── usage.rs               # OAuth usage API fetch + response models
-│   │   └── push.rs                # HTTP push to device with API key auth
+│   │   ├── main.rs                # CLI args, poll loop, daemonization
+│   │   ├── credentials.rs         # Keychain/file reading, token refresh
+│   │   ├── usage.rs               # Usage API fetch, response models
+│   │   └── push.rs                # HTTP push to device, HMAC auth
 │   └── resources/
-│       └── com.claude.usage-daemon.plist  # macOS launchd service config
+│       ├── com.claude.usage-daemon.plist   # macOS launchd template
+│       └── claude-usage-daemon.service     # Linux systemd template
 │
-├── claude_monitor/                # ESP8266 firmware
-│   └── claude_monitor.ino         # Push-only display, API key auth, port 8080
+├── claude_monitor/                # ESP8266 firmware (Arduino)
+│   └── claude_monitor.ino
 │
-├── claude_monitor_atoms3r/        # ATOMS3R firmware
-│   ├── platformio.ini             # PlatformIO build config
-│   ├── src/main.cpp               # Push-only display, API key auth, port 8080
-│   └── README.md                  # ATOMS3R-specific hardware docs
+├── claude_monitor_atoms3r/        # ATOMS3R firmware (PlatformIO)
+│   ├── platformio.ini
+│   └── src/main.cpp
 │
-├── background.js                  # Chrome extension: alarms, fetching, relay
-├── content.js                     # Chrome extension: injects sniffer into page
-├── injected.js                    # Chrome extension: main-world fetch interception
-├── manifest.json                  # Extension MV3 configuration & permissions
-├── popup.html / .css / .js        # Heatmap Dashboard UI layer
-├── options.html / .css / .js      # Settings & configuration portal
-├── icons/                         # Extension branding assets
-├── docs/images/                   # UI and hardware photography
+├── shared/
+│   └── claude_monitor_common.h    # Shared auth, HTTP handlers, display logic
+│
+├── background.js                  # Chrome extension service worker
+├── content.js                     # Extension: page injection
+├── injected.js                    # Extension: fetch interception for org ID
+├── popup.html / popup.js          # Extension: dashboard UI
+├── options.html / options.js      # Extension: settings
+├── manifest.json                  # Extension manifest (MV3)
+│
+├── docs/
+│   ├── HOW_USAGE_DATA_WORKS.md    # Auth and API deep dive
+│   └── SECURITY.md                # HMAC auth protocol
+│
+├── setup.sh                       # Interactive setup script
 ├── Makefile                       # Build shortcuts
-├── README_firmware.md             # Hardware pin reference
-└── README.md                      # You are here
+└── .github/workflows/             # CI and release builds
 ```
 
 ---
 
-## Technical Debt Tour
+## License
 
-> **Full disclosure:** To make this work, several deliberate crimes against software engineering were committed.
-
-| The Crime | Why it was necessary |
-|-----------|----------------------|
-| **Main-world `<script>` tags** | MV3 content scripts are heavily isolated. A standard `window.fetch` patch does nothing from the context block, so we inject raw DOM scripts to wiretap network traffic natively. |
-| **XOR'd OAuth client ID** | The daemon uses a public OAuth client ID for token refresh. It's XOR-obfuscated in the binary to avoid appearing in `strings` output. Not real security, just hygiene. |
-| **Polling instead of WebSockets** | Anthropic doesn't expose a subscription for usage data. We poll every 5 minutes. |
-| **The 24-second Chrome alarm** | MV3 Service Workers aggressively go to sleep, wiping the live badge data. An invisible alarm fires constantly just to keep the extension context "breathing". |
-| **`libc::daemon()` on macOS** | macOS marks this deprecated in favor of launchd, but it works fine and is the standard Unix daemonization call. We provide a launchd plist too. |
-| **RFC1918 host permissions** | The extension needs to push usage data to a LAN device over plain HTTP. Permissions are restricted to private address ranges (192.168.x, 10.x, 172.16-31.x, localhost). |
-
----
-
-## API Reference
-
-### Device HTTP API
-
-Both firmware variants expose the same HTTP API on port 8080 (configurable via `HTTP_PORT`).
-
-Authenticated endpoints use HMAC-SHA256 challenge-response auth (nonce from `/ping`, signature in request headers). Legacy `X-API-Key` header is still accepted for backward compatibility. See [Security](docs/SECURITY.md) for details.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/usage` | Push usage data from daemon. Body: JSON (see below). |
-| `GET` | `/status` | Return current usage state, staleness, IP, and port. |
-
-**POST /usage body:**
-
-```json
-{
-  "five_hour": 45.2,
-  "five_hour_resets_at": "2026-03-22T18:00:00Z",
-  "seven_day": 12.8,
-  "seven_day_resets_at": "2026-03-25T00:00:00Z",
-  "seven_day_opus": 8.1,
-  "seven_day_sonnet": 15.0,
-  "timestamp": 1742673600
-}
-```
-
----
-
-## Daemon Resource Profile
-
-The Rust daemon is designed to run indefinitely as a background process. Profiled on Apple Silicon (arm64) over a 5-minute run with 10-second poll intervals:
-
-| Metric | Value |
-|--------|-------|
-| Binary size | 3.8 MB (stripped, LTO) |
-| Physical memory (macOS) | 4.5 MB |
-| RSS steady-state | ~12 MB |
-| RSS peak | 13 MB |
-| CPU (idle) | 0.0% |
-| Threads (steady-state) | 2 |
-
-**No memory leak.** RSS peaked at 13 MB during initial HTTP client setup, then settled to ~12 MB. The macOS physical footprint (4.5 MB) reflects actual memory pressure. RSS is dominated by the TLS stack (rustls) and reqwest's connection pool; the daemon's own state is negligible.
-
-**Zero idle CPU.** The process blocks on tokio timers between poll cycles. Each cycle is one HTTPS request + JSON parse + one LAN HTTP push. Thread count briefly spikes to 3-6 during TLS handshakes, returning to 2 immediately.
-
----
-
-## License & Fair Use
-
-This project interacts with OAuth APIs that may change. If Anthropic modifies the endpoint structure or authentication flow, the daemon will need updating. It is built strictly as a personal engineering project to monitor one's own usage data, and sends zero telemetry to the cloud.
-
-> *Use responsibly. Stop refreshing the metrics page and get back to work.*
-
----
-
-<div align="center">
-
-**Over Engineered with gears by Venky**
-</div>
+This project interacts with OAuth APIs that may change. Built as a personal project to monitor one's own usage data. Sends zero telemetry.

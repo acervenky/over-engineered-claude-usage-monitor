@@ -1,0 +1,23 @@
+# Template -- install.sh substitutes DEVICE_HOST with the actual IP/hostname.
+# Do NOT use --daemon flag; systemd manages the process lifecycle.
+#
+# Manual install:
+#   cp this file to ~/.config/systemd/user/claude-usage-daemon.service
+#   Edit ExecStart with your device host
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-usage-daemon
+
+[Unit]
+Description=Claude Usage Monitor Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-usage-daemon --device-host DEVICE_HOST
+Restart=on-failure
+RestartSec=60
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

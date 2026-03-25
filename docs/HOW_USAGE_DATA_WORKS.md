@@ -18,11 +18,11 @@ The Claude CLI writes OAuth tokens on login. The daemon reads them without promp
 
 | Platform | Primary | Fallback |
 |----------|---------|----------|
-| macOS | Keychain (service: `Claude Code-credentials-{sha256_8hex}`) | `~/.claude/.credentials.json` |
+| macOS | Keychain (service: `Claude Code-credentials`) | `~/.claude/.credentials.json` |
 | Linux | -- | `~/.claude/.credentials.json` |
 | Windows | -- | `%USERPROFILE%\.claude\.credentials.json` |
 
-The Keychain service name is derived by SHA-256 hashing the config directory path and taking the first 4 bytes as hex. The account name is the current `$USER`.
+Current Claude CLI versions use the plain service name `Claude Code-credentials`. Older versions used a hash-suffixed name: `Claude Code-credentials-{sha256_8hex}` (SHA-256 of the config directory path, first 4 bytes as hex). The daemon tries both automatically. The account name is the current `$USER`.
 
 **Credential JSON format (nested):**
 

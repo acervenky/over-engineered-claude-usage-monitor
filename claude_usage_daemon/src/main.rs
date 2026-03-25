@@ -269,20 +269,72 @@ async fn run(args: Args) {
         .build()
         .expect("Failed to create HTTP client");
 
-    // Startup device connectivity check.
-    match push::ping_device(&http, &args.device_host, args.device_port).await {
-        Ok(Some(_)) => log::info!(
-            "Device reachable at {}:{} (HMAC auth supported)",
-            args.device_host, args.device_port
-        ),
-        Ok(None) => log::info!(
-            "Device reachable at {}:{} (legacy auth, no HMAC nonce)",
-            args.device_host, args.device_port
-        ),
-        Err(e) => log::warn!("Device not reachable at startup: {e} (will retry on each push)"),
+    // Install shutdown signal handler early so Ctrl+C works at any point.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    // Startup: retry device connectivity, then push immediately.
+    let mut startup_ok = false;
+    for attempt in 1..=5 {
+        match push::ping_device(&http, &args.device_host, args.device_port).await {
+            Ok(Some(_)) => {
+                log::info!(
+                    "Device reachable at {}:{} (HMAC auth supported)",
+                    args.device_host, args.device_port
+                );
+                startup_ok = true;
+                break;
+            }
+            Ok(None) => {
+                log::info!(
+                    "Device reachable at {}:{} (legacy auth, no HMAC nonce)",
+                    args.device_host, args.device_port
+                );
+                startup_ok = true;
+                break;
+            }
+            Err(e) => {
+                if attempt < 5 {
+                    log::warn!(
+                        "Device not reachable (attempt {attempt}/5): {e}, retrying in 3s..."
+                    );
+                    tokio::select! {
+                        _ = time::sleep(Duration::from_secs(3)) => {}
+                        _ = &mut shutdown => {
+                            log::info!("Shutting down");
+                            cleanup_pid(&args);
+                            return;
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "Device not reachable after 5 attempts: {e} (will retry on each push)"
+                    );
+                }
+            }
+        }
     }
 
     let mut state = PollState::new();
+
+    // Push data immediately so device exits "waiting for daemon".
+    if startup_ok {
+        tokio::select! {
+            _ = poll_and_push(
+                &http,
+                &config_dir,
+                &args.device_host,
+                args.device_port,
+                &args.api_key,
+                &mut state,
+            ) => {}
+            _ = &mut shutdown => {
+                log::info!("Shutting down");
+                cleanup_pid(&args);
+                return;
+            }
+        }
+    }
 
     loop {
         let sleep_dur = state.next_interval(base_interval);
@@ -297,7 +349,7 @@ async fn run(args: Args) {
                     &mut state,
                 ).await;
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 log::info!("Shutting down");
                 cleanup_pid(&args);
                 break;
@@ -427,7 +479,7 @@ async fn poll_and_push(
 
     // -- Push to device --
     match push::push_to_device(http, device_host, device_port, api_key, &payload).await {
-        Ok(()) => log::debug!("Pushed to device"),
+        Ok(()) => log::info!("Pushed to device successfully"),
         Err(push::PushError::AuthRejected(e)) => {
             log::error!("{e}");
         }

@@ -25,8 +25,8 @@
 #ifndef HTTP_PORT
   #error "Define HTTP_PORT before including claude_monitor_common.h"
 #endif
-#ifndef TZ_OFFSET_SEC
-  #error "Define TZ_OFFSET_SEC before including claude_monitor_common.h"
+#ifndef TIMEZONE
+  #error "Define TIMEZONE before including claude_monitor_common.h (e.g. \"CST6CDT,M3.2.0,M11.1.0\")"
 #endif
 
 // -- Optional defaults ----------------------------------------------------
@@ -49,11 +49,16 @@ struct UsageData {
   long  sevenDaySecs = -1;
   unsigned long receivedAt = 0;
   bool  valid = false;
+  bool  daemonSeen = false;        // true after first /ping or /usage from daemon
+  unsigned long lastAuthFailMs = 0; // millis() of last auth failure, 0 = none
 };
 
 UsageData gUsage;
 char noncePool[NONCE_POOL_SIZE][NONCE_HEX_LEN + 1];
 uint8_t nonceHead = 0;
+
+// Firmware loop should check this to avoid redundant redraws.
+unsigned long lastDrawMs = 0;
 
 // -- Platform-provided symbols (declared, not defined) --------------------
 extern MonitorWebServer server;
@@ -133,21 +138,36 @@ bool checkAuth() {
 }
 
 void sendUnauthorized() {
+  gUsage.daemonSeen = true;  // something tried to talk to us
+  gUsage.lastAuthFailMs = millis();
+  Serial.println("AUTH FAIL: request rejected (bad key or signature)");
   server.send(401, "application/json", "{\"error\":\"unauthorized\"}");
+  drawScreen();
+  lastDrawMs = millis();
 }
 
 // -- Time helpers ---------------------------------------------------------
 
-// Parse ISO8601 to seconds from now.
-// mktime() treats tm as local time. This code only stays UTC-correct while
-// configTime() keeps the DST offset at 0.
+// Convert a broken-down UTC time to epoch seconds without depending on
+// the C library's timezone state. Portable across ESP8266/ESP32.
+static time_t utcToEpoch(int year, int mon, int mday, int hour, int min, int sec) {
+  // Days from year 0 to start of each month (non-leap).
+  static const int mdays[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  long y = year;
+  long days = 365 * y + y / 4 - y / 100 + y / 400 + mdays[mon - 1] + mday - 1;
+  // Leap day adjustment: if month <= Feb of a leap year, subtract 1.
+  if (mon <= 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) days--;
+  // Epoch is 1970-01-01, which is day 719162 from year 0.
+  days -= 719162L;
+  return (time_t)(days * 86400L + hour * 3600L + min * 60L + sec);
+}
+
+// Parse ISO8601 UTC timestamp to seconds from now.
+// Input is always UTC (e.g. "2026-03-22T18:00:00Z").
 long parseResetsAt(const char* iso) {
-  struct tm t = {};
-  sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d",
-    &t.tm_year, &t.tm_mon, &t.tm_mday,
-    &t.tm_hour, &t.tm_min, &t.tm_sec);
-  t.tm_year -= 1900; t.tm_mon -= 1;
-  time_t resetUtc = mktime(&t) + TZ_OFFSET_SEC;
+  int y, mo, d, h, mi, s;
+  sscanf(iso, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s);
+  time_t resetUtc = utcToEpoch(y, mo, d, h, mi, s);
   return (long)(resetUtc - time(nullptr));
 }
 
@@ -221,9 +241,6 @@ void handleUsage() {
   lastDrawMs = millis();  // Reset draw timer to avoid duplicate redraw.
 }
 
-// Firmware loop should check this to avoid redundant redraws.
-unsigned long lastDrawMs = 0;
-
 void handleStatus() {
   if (!checkAuth()) { sendUnauthorized(); return; }
 
@@ -240,6 +257,9 @@ void handleStatus() {
 
 // Lightweight health check for daemon connectivity verification.
 void handlePing() {
+  bool wasUnseen = !gUsage.daemonSeen;
+  gUsage.daemonSeen = true;
+
   StaticJsonDocument<192> doc;
   doc["ok"] = true;
   doc["uptime"] = millis() / 1000;
@@ -251,6 +271,12 @@ void handlePing() {
   }
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
+
+  // Redraw so display transitions from "waiting for daemon" to "connected".
+  if (wasUnseen) {
+    drawScreen();
+    lastDrawMs = millis();
+  }
 }
 
 void handleNotFound() {

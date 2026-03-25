@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use security_framework::passwords::get_generic_password;
+use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,13 @@ const LOCK_MAX_RETRIES: u32 = 5;
 const LOCK_BACKOFF_MIN_MS: u64 = 1000;
 const LOCK_BACKOFF_MAX_MS: u64 = 2000;
 
+/// Where credentials were loaded from, so we save back to the same place.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CredentialSource {
+    Keychain,
+    File,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthCredentials {
@@ -25,6 +32,9 @@ pub struct OAuthCredentials {
     /// Milliseconds since epoch.
     pub expires_at: Option<u64>,
     pub scopes: Option<Vec<String>>,
+    /// Where these credentials were loaded from (not serialized).
+    #[serde(skip)]
+    pub source: Option<CredentialSource>,
 }
 
 /// Redact token values to prevent accidental leaks in logs.
@@ -99,31 +109,48 @@ fn parse_credentials(json: &str) -> Result<OAuthCredentials, String> {
             refresh_token: file.refresh_token,
             expires_at: file.expires_at,
             scopes: None,
+            source: None,
         });
     }
 
     Err("No OAuth credentials found in JSON".into())
 }
 
-/// Build the keychain service name that matches Claude CLI's format.
-fn keychain_service_name(config_dir: &Path) -> String {
+/// Build the legacy keychain service name (hash-suffixed, older CLI versions).
+fn keychain_service_name_legacy(config_dir: &Path) -> String {
     let dir_str = config_dir.to_string_lossy();
     let hash = Sha256::digest(dir_str.as_bytes());
     let hash8 = hex::encode(&hash[..4]);
     format!("Claude Code-credentials-{hash8}")
 }
 
+/// Current CLI uses plain service name without hash suffix.
+const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
 #[cfg(target_os = "macos")]
 fn read_from_keychain(config_dir: &Path) -> Result<OAuthCredentials, String> {
-    let service = keychain_service_name(config_dir);
     let account = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".into());
 
-    log::debug!("Reading keychain: service={service}, account={account}");
+    // Try current format first: "Claude Code-credentials" with $USER account.
+    log::debug!("Reading keychain: service={KEYCHAIN_SERVICE}, account={account}");
+    match get_generic_password(KEYCHAIN_SERVICE, &account) {
+        Ok(bytes) => {
+            let json = String::from_utf8(bytes.to_vec())
+                .map_err(|e| format!("Keychain value is not UTF-8: {e}"))?;
+            return parse_credentials(&json);
+        }
+        Err(e) => {
+            log::debug!("Keychain lookup failed for {KEYCHAIN_SERVICE}: {e}");
+        }
+    }
 
-    let password_bytes = get_generic_password(&service, &account)
-        .map_err(|e| format!("Keychain read failed: {e}"))?;
+    // Fall back to legacy hash-suffixed format for older CLI versions.
+    let legacy_service = keychain_service_name_legacy(config_dir);
+    log::debug!("Trying legacy keychain: service={legacy_service}, account={account}");
+    let bytes = get_generic_password(&legacy_service, &account)
+        .map_err(|e| format!("Keychain read failed (tried {KEYCHAIN_SERVICE} and {legacy_service}): {e}"))?;
 
-    let json = String::from_utf8(password_bytes.to_vec())
+    let json = String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("Keychain value is not UTF-8: {e}"))?;
 
     parse_credentials(&json)
@@ -147,15 +174,29 @@ fn read_from_file(config_dir: &Path) -> Result<OAuthCredentials, String> {
 /// Load credentials, trying Keychain first (macOS), then file fallback.
 pub fn load_credentials(config_dir: &Path) -> Result<OAuthCredentials, CredentialError> {
     match read_from_keychain(config_dir) {
-        Ok(creds) => {
+        Ok(mut creds) => {
             log::info!("Loaded credentials from Keychain");
+            creds.source = Some(CredentialSource::Keychain);
+            return Ok(creds);
+        }
+        Err(e) => {
+            log::warn!("Keychain read failed: {e}");
+        }
+    }
+
+    match read_from_file(config_dir) {
+        Ok(mut creds) => {
+            log::info!("Loaded credentials from file");
+            creds.source = Some(CredentialSource::File);
             Ok(creds)
         }
         Err(e) => {
-            log::debug!("Keychain unavailable ({e}), trying credentials file");
-            read_from_file(config_dir).inspect(|_| {
-                log::info!("Loaded credentials from file");
-            }).map_err(CredentialError::NotFound)
+            log::warn!("Credentials file failed: {e}");
+            Err(CredentialError::NotFound(format!(
+                "No credentials found. Tried macOS Keychain and {}/{}. Run `claude` to log in.",
+                config_dir.display(),
+                ".credentials.json"
+            )))
         }
     }
 }
@@ -224,19 +265,49 @@ pub async fn refresh_token(
             .or_else(|| creds.refresh_token.clone()),
         expires_at: token_resp.expires_in.map(|secs| now_ms + secs * 1000),
         scopes: creds.scopes.clone(),
+        source: creds.source.clone(),
     };
 
-    if let Err(e) = save_credentials(&new_creds, config_dir).await {
+    let source = creds.source.as_ref().unwrap_or(&CredentialSource::File);
+    if let Err(e) = save_credentials(&new_creds, config_dir, source).await {
         log::warn!("Failed to persist refreshed credentials: {e}");
     }
 
     Ok(new_creds)
 }
 
-/// Save credentials atomically with file locking.
-/// Writes to a temp file then renames, with advisory lock to avoid
-/// races with concurrent Claude CLI processes.
-async fn save_credentials(creds: &OAuthCredentials, config_dir: &Path) -> Result<(), String> {
+/// Save refreshed credentials back to the source they were loaded from.
+async fn save_credentials(
+    creds: &OAuthCredentials,
+    config_dir: &Path,
+    source: &CredentialSource,
+) -> Result<(), String> {
+    match source {
+        CredentialSource::Keychain => save_to_keychain(creds),
+        CredentialSource::File => save_to_file(creds, config_dir).await,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn save_to_keychain(creds: &OAuthCredentials) -> Result<(), String> {
+    let account = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".into());
+    let wrapper = serde_json::json!({ "claudeAiOauth": creds });
+    let json = serde_json::to_string(&wrapper)
+        .map_err(|e| format!("JSON serialize error: {e}"))?;
+
+    set_generic_password(KEYCHAIN_SERVICE, &account, json.as_bytes())
+        .map_err(|e| format!("Keychain write failed: {e}"))?;
+
+    log::debug!("Saved refreshed credentials to Keychain");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_to_keychain(_creds: &OAuthCredentials) -> Result<(), String> {
+    Err("Keychain not available on this platform".into())
+}
+
+async fn save_to_file(creds: &OAuthCredentials, config_dir: &Path) -> Result<(), String> {
     use fs2::FileExt;
     use rand::Rng;
 
@@ -387,6 +458,7 @@ mod tests {
             refresh_token: None,
             expires_at: Some(0), // epoch = long past
             scopes: None,
+            source: None,
         };
         assert!(creds.is_expired());
     }
@@ -400,6 +472,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             scopes: None,
+            source: None,
         };
         assert!(!creds.is_expired());
     }
@@ -416,6 +489,7 @@ mod tests {
             refresh_token: None,
             expires_at: Some(future_ms),
             scopes: None,
+            source: None,
         };
         assert!(!creds.is_expired());
     }

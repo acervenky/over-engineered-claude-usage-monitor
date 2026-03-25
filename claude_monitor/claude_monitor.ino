@@ -27,6 +27,12 @@
 
 // -- User config ----------------------------------------------------------
 
+// Optional Static IP configuration. Uncomment and set to use a static IP instead of DHCP.
+// Ensure you use commas, not dots, for the IP octets.
+// #define STATIC_IP 192, 168, 1, 100
+// #define STATIC_GW 192, 168, 1, 1
+// #define STATIC_SN 255, 255, 255, 0
+
 // HTTP port the device listens on. Must match --device-port on the daemon.
 #define HTTP_PORT  8080
 
@@ -34,8 +40,33 @@
 // Change this to a unique value. Same key goes in the daemon's --api-key flag.
 #define API_KEY  "sup3rs3cr3t"
 
-#define NTP_SERVER       "pool.ntp.org"
-#define TZ_OFFSET_SEC    (5 * 3600 + 30 * 60)  // IST (UTC+5:30)
+// POSIX timezone string. Handles DST transitions automatically.
+// Pick one and uncomment, or write your own POSIX TZ string.
+//
+// -- US --
+// #define TIMEZONE  "CST6CDT,M3.2.0,M11.1.0"   // US Central
+// #define TIMEZONE  "EST5EDT,M3.2.0,M11.1.0"   // US Eastern
+// #define TIMEZONE  "MST7MDT,M3.2.0,M11.1.0"   // US Mountain
+// #define TIMEZONE  "PST8PDT,M3.2.0,M11.1.0"   // US Pacific
+// #define TIMEZONE  "MST7"                       // Arizona (no DST)
+// #define TIMEZONE  "HST10"                      // Hawaii (no DST)
+//
+// -- Europe --
+// #define TIMEZONE  "GMT0BST,M3.5.0/1,M10.5.0"  // UK
+// #define TIMEZONE  "CET-1CEST,M3.5.0,M10.5.0/3" // Central Europe
+// #define TIMEZONE  "EET-2EEST,M3.5.0/3,M10.5.0/4" // Eastern Europe
+//
+// -- Asia / Oceania --
+#define TIMEZONE  "IST-5:30"                   // India (no DST)
+// #define TIMEZONE  "JST-9"                      // Japan (no DST)
+// #define TIMEZONE  "KST-9"                      // Korea (no DST)
+// #define TIMEZONE  "CST-8"                      // China (no DST)
+// #define TIMEZONE  "AEST-10AEDT,M10.1.0,M4.1.0/3" // Australia Eastern
+//
+// -- Other --
+// #define TIMEZONE  "UTC0"                       // UTC (no DST)
+
+#define NTP_SERVER  "pool.ntp.org"
 
 // Data is considered stale if no push received within this window.
 #define STALE_THRESHOLD_MS (10UL * 60 * 1000)  // 10 minutes
@@ -100,8 +131,22 @@ void drawScreen() {
     u8g2.setFont(u8g2_font_5x7_tf);
     if (!gWifiOk) {
       u8g2.drawStr(10, 35, "no wifi...");
+    } else if (gUsage.lastAuthFailMs != 0) {
+      // Daemon tried to push but auth failed
+      u8g2.drawStr(0, 22, "AUTH FAILED");
+      u8g2.drawHLine(0, 25, 128);
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(0, 36, "API_KEY mismatch");
+      u8g2.drawStr(0, 46, "check daemon --api-key");
+      u8g2.drawStr(0, 56, "matches firmware key");
+    } else if (gUsage.daemonSeen) {
+      // Daemon pinged us but hasn't pushed data yet
+      u8g2.drawStr(0, 22, "daemon found");
+      u8g2.drawHLine(0, 25, 128);
+      u8g2.setFont(u8g2_font_4x6_tf);
+      u8g2.drawStr(0, 36, "fetching data...");
     } else {
-      // Show IP:port and waiting message
+      // No contact from daemon yet
       char addrBuf[32];
       snprintf(addrBuf, sizeof(addrBuf), "%s:%d",
         WiFi.localIP().toString().c_str(), HTTP_PORT);
@@ -186,20 +231,27 @@ void setup() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
 
+#ifdef STATIC_IP
+  IPAddress ip(STATIC_IP);
+  IPAddress gw(STATIC_GW);
+  IPAddress sn(STATIC_SN);
+  wm.setSTAStaticIPConfig(ip, gw, sn);
+#endif
+
   wm.setAPCallback([](WiFiManager* wm) {
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_5x7_tf);
     u8g2.drawStr(0, 10, "WIFI SETUP");
     u8g2.drawHLine(0, 12, 128);
     u8g2.drawStr(0, 24, "Connect to:");
-    u8g2.drawStr(0, 34, "ClaudeMonitor");
+    u8g2.drawStr(0, 34, "ClaudeMonitor-Setup");
     u8g2.setFont(u8g2_font_4x6_tf);
     u8g2.drawStr(0, 46, "then open 192.168.4.1");
     u8g2.drawStr(0, 56, "to enter WiFi password");
     u8g2.sendBuffer();
   });
 
-  if (!wm.autoConnect("ClaudeMonitor")) {
+  if (!wm.autoConnect("ClaudeMonitor-Setup")) {
     u8g2.clearBuffer();
     u8g2.drawStr(5, 32, "wifi failed");
     u8g2.sendBuffer();
@@ -209,8 +261,8 @@ void setup() {
 
   gWifiOk = true;
 
-  // Keep DST disabled. parseResetsAt() relies on a fixed offset here.
-  configTime(TZ_OFFSET_SEC, 0, NTP_SERVER);
+  // POSIX TZ string handles DST transitions automatically.
+  configTzTime(TIMEZONE, NTP_SERVER);
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_5x7_tf);
@@ -236,6 +288,15 @@ void setup() {
   u8g2.drawStr(0, 52, "run: claude-usage-daemon");
   u8g2.drawStr(0, 60, "  --device-ip <this IP>");
   u8g2.sendBuffer();
+
+  Serial.println();
+  Serial.println("===============================");
+  Serial.print("WiFi connected! IP: ");
+  Serial.println(WiFi.localIP().toString());
+  Serial.print("Listening on HTTP port: ");
+  Serial.println(HTTP_PORT);
+  Serial.println("===============================");
+
   delay(5000);
 
   // Collect auth headers so we can read them in handlers.

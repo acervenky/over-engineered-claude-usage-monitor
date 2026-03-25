@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: claude_usage_daemon
+
+      - name: Run tests
+        run: cargo test --manifest-path claude_usage_daemon/Cargo.toml
+
+      - name: Run clippy
+        run: cargo clippy --manifest-path claude_usage_daemon/Cargo.toml -- -D warnings
